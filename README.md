@@ -15,6 +15,10 @@ In the Agents window, an `opencode` host with:
 
 - **Sessions** — start new sessions, see the live list with opencode's
   titles and statuses, and pick up where you left off after a reconnect.
+- **Working directories** — VS Code's folder picker works against the host's
+  filesystem, and a session started in a picked folder runs *there*: its
+  agent, changesets, terminal, and file reads are scoped to that
+  directory (sessions without one use the plugin's own location).
 - **Model picker** — the real opencode catalog: every provider and model
   your server exposes.
 - **Agent picker** — opencode's user-invocable agents (Build, Plan, and

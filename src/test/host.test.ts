@@ -22,15 +22,18 @@ import {
 } from "@microsoft/agent-host-protocol";
 import {
   DISCARD_OPERATION_ID,
+  directoryUri,
   fileUri,
   headContentRef,
   mapV2Event,
   snapContentRef,
   type FacadeAgent,
   type FacadeClientTool,
+  type FacadeDirectoryEntry,
   type FacadeDiffFile,
   type FacadeEvent,
   type FacadeProvider,
+  type FacadeResourceInfo,
   type FacadeSession,
   type OpencodeFacade,
 } from "../bridge.js";
@@ -138,6 +141,7 @@ class FakeFacade implements OpencodeFacade {
     id?: string;
     model?: { providerID: string; modelID: string; variant?: string };
     metadata?: Record<string, unknown>;
+    location?: { directory: string };
   } | undefined)[] = [];
   getSessionsCalls: string[] = [];
   // ── multi-chat ─────────────────────────────────────
@@ -154,11 +158,24 @@ class FakeFacade implements OpencodeFacade {
   disk = new Map<string, string>();
   /** File content in HEAD (absPath → content; absent = not in HEAD). */
   head = new Map<string, string>();
-  discardCalls: string[] = [];
+  discardCalls: { path: string; directory?: string }[] = [];
   writeCalls: { path: string; content: string }[] = [];
   deleteCalls: string[] = [];
   /** When set, vcsDiffWorking throws (the changeset errors out). */
   diffError: string | null = null;
+  /** Every `vcsDiffWorking` call (undefined = the plugin's own location). */
+  diffCalls: (string | undefined)[] = [];
+  /** Every `gitHeadFile` call (directory = the resolving session's dir). */
+  headCalls: { path: string; directory?: string }[] = [];
+  // ── resources ──────────────────────────────────────
+  /** Directories on the fake resource FS (absolute paths; files live in `disk`). */
+  dirs = new Set<string>();
+  /** Symlinks on the fake resource FS (link path → target path). */
+  symlinks = new Map<string, string>();
+  /** Paths the fake resource FS refuses with EACCES (the -32009 mapping). */
+  restricted = new Set<string>();
+  /** The fake resource FS's mtime/ctime (epoch ms) for metadata results. */
+  resourceTime = 1_700_000_000_000;
   // ── client tools ──────────────────────────────────
   /** Every `syncClientTools` call (the cross-session union each time). */
   syncClientToolsCalls: FacadeClientTool[][] = [];
@@ -198,6 +215,7 @@ class FakeFacade implements OpencodeFacade {
     agent?: string;
     model?: { providerID: string; modelID: string; variant?: string };
     metadata?: Record<string, unknown>;
+    location?: { directory: string };
   }) {
     this.createCalls.push(input ?? undefined);
     const id = input?.id ?? `ses_fake_${this.sessions.size + 1}`;
@@ -212,6 +230,9 @@ class FakeFacade implements OpencodeFacade {
       // is written at create and must survive a "restart" (fresh host over
       // the same facade sessions).
       ...(input?.metadata !== undefined ? { metadata: input.metadata } : {}),
+      // opencode reports the session's location (absent → the plugin's
+      // own location, which the fake does not model).
+      ...(input?.location !== undefined ? { location: input.location } : {}),
     };
     this.sessions.set(id, fs);
     // opencode fires session.created synchronously during create — the
@@ -274,11 +295,13 @@ class FakeFacade implements OpencodeFacade {
     }
   }
   // ── changesets ─────────────────────────────────────────────────
-  async vcsDiffWorking(): Promise<readonly FacadeDiffFile[]> {
+  async vcsDiffWorking(directory?: string): Promise<readonly FacadeDiffFile[]> {
+    this.diffCalls.push(directory);
     if (this.diffError !== null) throw new Error(this.diffError);
     return this.diffFiles;
   }
-  async gitHeadFile(absPath: string): Promise<string | null> {
+  async gitHeadFile(absPath: string, directory?: string): Promise<string | null> {
+    this.headCalls.push({ path: absPath, directory });
     return this.head.get(absPath) ?? null;
   }
   async readFile(absPath: string): Promise<string | null> {
@@ -295,12 +318,105 @@ class FakeFacade implements OpencodeFacade {
   /** Discard one file: drop it from the working diff and restore the disk
    * content from HEAD (deleted when the file is untracked, like the real
    * facade). */
-  async discardFile(absPath: string): Promise<void> {
-    this.discardCalls.push(absPath);
+  async discardFile(absPath: string, directory?: string): Promise<void> {
+    this.discardCalls.push({ path: absPath, directory });
     this.diffFiles = this.diffFiles.filter((d) => d.path !== absPath);
     const headContent = this.head.get(absPath);
     if (headContent !== undefined) this.disk.set(absPath, headContent);
     else this.disk.delete(absPath);
+  }
+  // ── resources ─────────────────────────────────────────────────
+  private errno(code: string, path: string, syscall: string): NodeJS.ErrnoException {
+    const err = new Error(`${syscall} ${code} ${path}`) as NodeJS.ErrnoException;
+    err.code = code;
+    return err;
+  }
+
+  /**
+   * Stat a fake resource-FS path: with `follow` false, lstat semantics
+   * (a symlink reports itself); with true, the link chain is followed and
+   * the target's canonical path is returned. Throws a Node ErrnoException
+   * (ENOENT/EACCES) on failure, like the real facade.
+   */
+  private fsStat(absPath: string, follow: boolean): { path: string; type: "file" | "directory" | "symlink" } {
+    if (!follow) {
+      if (this.restricted.has(absPath)) throw this.errno("EACCES", absPath, "stat");
+      if (this.symlinks.has(absPath)) return { path: absPath, type: "symlink" };
+      if (this.dirs.has(absPath)) return { path: absPath, type: "directory" };
+      if (this.disk.has(absPath)) return { path: absPath, type: "file" };
+      throw this.errno("ENOENT", absPath, "stat");
+    }
+    let current = absPath;
+    if (this.restricted.has(current)) throw this.errno("EACCES", current, "stat");
+    for (let i = 0; i < 10; i++) {
+      const target = this.symlinks.get(current);
+      if (target === undefined) break;
+      current = target;
+    }
+    if (this.restricted.has(current)) throw this.errno("EACCES", current, "stat");
+    if (this.dirs.has(current)) return { path: current, type: "directory" };
+    if (this.disk.has(current)) return { path: current, type: "file" };
+    throw this.errno("ENOENT", current, "stat");
+  }
+
+  async resolveResource(absPath: string, followSymlinks?: boolean): Promise<FacadeResourceInfo> {
+    const s = this.fsStat(absPath, followSymlinks !== false);
+    const size = s.type === "file" ? Buffer.byteLength(this.disk.get(s.path) ?? "", "utf8") : 0;
+    return { path: s.path, type: s.type, size, mtime: this.resourceTime, ctime: this.resourceTime };
+  }
+
+  async listDirectory(absPath: string): Promise<readonly FacadeDirectoryEntry[]> {
+    const s = this.fsStat(absPath, true);
+    if (s.type !== "directory") throw this.errno("ENOTDIR", absPath, "readdir");
+    const prefix = `${s.path}/`;
+    const entries: FacadeDirectoryEntry[] = [];
+    const seen = new Map<string, "file" | "directory">();
+    for (const path of [...this.disk.keys(), ...this.dirs, ...this.symlinks.keys()]) {
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.slice(prefix.length);
+      const name = rest.split("/")[0];
+      if (rest.includes("/") || name === undefined || name.length === 0) continue;
+      let type: "file" | "directory";
+      if (this.disk.has(path)) type = "file";
+      else if (this.dirs.has(path)) type = "directory";
+      else {
+        // A symlink: follow it — a link to a directory lists as a
+        // directory, a dangling link as a file (the real facade's stat).
+        try {
+          type = this.fsStat(path, true).type === "directory" ? "directory" : "file";
+        } catch {
+          type = "file";
+        }
+      }
+      if (!seen.has(name)) {
+        seen.set(name, type);
+        entries.push({ name, type });
+      }
+    }
+    // Directories first, then by name (the real facade's sort).
+    entries.sort((a, b) =>
+      a.type !== b.type ? (a.type === "directory" ? -1 : 1) : a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    );
+    return entries;
+  }
+
+  async mkdirResource(absPath: string): Promise<void> {
+    // `mkdir -p` semantics: an existing directory is a no-op; a path
+    // component occupied by a non-directory fails (final component →
+    // EEXIST, an intermediate one → ENOTDIR, like the real mkdir).
+    if (this.restricted.has(absPath)) throw this.errno("EACCES", absPath, "mkdir");
+    const parts = absPath.split("/").filter((p) => p.length > 0);
+    let current = "";
+    for (let i = 0; i < parts.length; i++) {
+      current = `${current}/${parts[i]}`;
+      if (this.restricted.has(current)) throw this.errno("EACCES", current, "mkdir");
+      if (this.dirs.has(current)) continue;
+      if (this.disk.has(current) || this.symlinks.has(current)) {
+        if (i === parts.length - 1) throw this.errno("EEXIST", current, "mkdir");
+        throw this.errno("ENOTDIR", current, "mkdir");
+      }
+      this.dirs.add(current);
+    }
   }
   async syncClientTools(tools: readonly FacadeClientTool[]): Promise<void> {
     this.syncClientToolsCalls.push([...tools]);
@@ -617,6 +733,64 @@ describe("createSession", () => {
     expect(sess.activeClients).toEqual([
       { clientId: "c1", displayName: "VS Code", tools: [] },
     ]);
+    h.stop();
+  });
+
+  it("honors workingDirectories[0] as the session's working directory (cross-location)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+
+    const res = await createSession(h, 1, sessionChannelURI("wd-sess"), {
+      provider: "gpuz",
+      workingDirectories: [`${directoryUri(OTHER)}`],
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    // The backend session is created in the target directory's location —
+    // trailing slash stripped (the record's directory is a plain path).
+    expect(h.facade.createCalls[0]!.location).toEqual({ directory: OTHER });
+
+    const added = h.notification("root/sessionAdded", 1);
+    expect(added!.params.summary.resource).toBe(sessionChannelURI("wd-sess"));
+    expect(added!.params.summary.workingDirectories).toEqual([directoryUri(OTHER)]);
+
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("wd-sess"), 101);
+    expect(sess.workingDirectories).toEqual([directoryUri(OTHER)]);
+    // The directory customization advertises the session's own directory,
+    // not the location's.
+    const { container } = agentDirectoryOf(sess);
+    expect(container.name).toBe("other-project");
+    h.stop();
+  });
+
+  it("ignores extra workingDirectories (no multipleWorkingDirectories capability)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await createSession(h, 1, sessionChannelURI("wd-extra"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OTHER), "file:///tmp/opencode/elsewhere/"],
+    });
+    expect(res.error).toBeUndefined();
+    expect(h.facade.createCalls[0]!.location).toEqual({ directory: OTHER });
+    expect(h.notification("root/sessionAdded", 1)!.params.summary.workingDirectories).toEqual([directoryUri(OTHER)]);
+    h.stop();
+  });
+
+  it("rejects malformed workingDirectories with -32602", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const bad = ["nope", [], [""], ["not-a-uri"], ["http://example.com/x"], [123]];
+    for (let i = 0; i < bad.length; i++) {
+      const res = await createSession(h, 1, sessionChannelURI(`wd-bad-${i}`), {
+        provider: "gpuz",
+        workingDirectories: bad[i] as unknown[],
+      }, 100 + i);
+      expect(res.error?.code).toBe(ERROR_INVALID_PARAMS);
+    }
+    expect(h.facade.createCalls).toHaveLength(0);
     h.stop();
   });
 });
@@ -1389,12 +1563,43 @@ describe("external sessions", () => {
     expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
     h.stop();
   }, 10000);
+
+  it("registers a cross-location session with its own working directory", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const t0 = Date.now() - 5000;
+    h.facade.sessions.set("ses_foreign", {
+      sessionID: "ses_foreign",
+      title: "Foreign session",
+      location: { directory: OTHER },
+      time: { created: t0, updated: t0 },
+    });
+
+    h.facade.push({ type: "session.created", sessionID: "ses_foreign", title: "Foreign session" });
+    await waitFor(
+      () => h.notification("root/sessionAdded", 1) !== undefined,
+      "root/sessionAdded for the external session",
+      3000,
+    );
+    const added = h.notification("root/sessionAdded", 1)!;
+    expect(added.params.summary.resource).toBe(sessionChannelURI("ses_foreign"));
+    // The session's own location — not the plugin's location directory.
+    expect(added.params.summary.workingDirectories).toEqual([directoryUri(OTHER)]);
+
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_foreign"), 163);
+    expect(sess.title).toBe("Foreign session");
+    expect(sess.workingDirectories).toEqual([directoryUri(OTHER)]);
+    h.stop();
+  }, 10000);
 });
 
 // ── changesets ───────────────────────────────────────────────────
 
 /** The harness location directory (HostOptions.defaultDirectory). */
 const DIR = "/tmp/opencode/ahp-scratch/project-lan";
+/** A working directory outside the location (cross-location sessions). */
+const OTHER = "/tmp/opencode/other-project";
 
 function startTurn(h: Harness, chatURI: string, turnId: string, seq = 1, text = "go"): void {
   h.send(1, "dispatchAction", {
@@ -1409,10 +1614,15 @@ function startTurn(h: Harness, chatURI: string, turnId: string, seq = 1, text = 
   });
 }
 
-async function resourceRead(h: Harness, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
-  h.send(1, "resourceRead", params, id);
-  await waitFor(() => h.frames.some((f) => f.socketId === 1 && f.message.id === id), `resourceRead (${id})`);
+/** Send one JSON-RPC request on socket 1 and return the response message. */
+async function rpc(h: Harness, method: string, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
+  h.send(1, method, params, id);
+  await waitFor(() => h.frames.some((f) => f.socketId === 1 && f.message.id === id), `${method} (${id})`);
   return h.frames.find((f) => f.socketId === 1 && f.message.id === id)!.message;
+}
+
+async function resourceRead(h: Harness, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
+  return rpc(h, "resourceRead", params, id);
 }
 
 async function invokeOp(h: Harness, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
@@ -1551,6 +1761,37 @@ describe("changeset subscribe and refresh", () => {
     await waitInit(h, 1);
     const res = await subscribe(h, 1, uncommittedChangesetURI("ahp-chat:/nope"), 314);
     expect(res.error?.code).toBe(-32001);
+    h.stop();
+  });
+
+  it("subscribe for a cross-location session diffs the session's own directory", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("ses_wdsub"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OTHER)],
+    }, 315);
+    const uri = uncommittedChangesetURI(chatChannelURI("ses_wdsub"));
+    const file = `${OTHER}/mod.txt`;
+    h.facade.diffFiles = [{ path: file, additions: 2, deletions: 1, status: "modified" }];
+    h.facade.head.set(file, "a\nOLD\n");
+
+    const state = await changesetSnapshot(h, uri, 316);
+    expect(state!.status).toBe("ready");
+    expect(state!.files).toEqual([
+      {
+        id: fileUri(file),
+        edit: {
+          before: { uri: fileUri(file), content: { uri: headContentRef(file) } },
+          after: { uri: fileUri(file), content: { uri: fileUri(file) } },
+          diff: { added: 2, removed: 1 },
+        },
+      },
+    ]);
+    // The diff was computed for the session's own directory, not the
+    // location's (the facade's last call carries it).
+    expect(h.facade.diffCalls[h.facade.diffCalls.length - 1]).toBe(OTHER);
     h.stop();
   });
 });
@@ -1762,6 +2003,51 @@ describe("turn changesets (before-capture)", () => {
     expect(state!.files).toEqual([]);
     h.stop();
   });
+
+  it("resolves a relative tool path against the session's own directory (cross-location)", async () => {
+    const WD_SES = "ses_wdturn";
+    const WD_TARGET = `${OTHER}/target.txt`;
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(WD_SES), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OTHER)],
+    }, 333);
+    const chatURI = chatChannelURI(WD_SES);
+    await subscribe(h, 1, chatURI, 334);
+    h.facade.disk.set(WD_TARGET, BEFORE);
+    startTurn(h, chatURI, "t1");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    // The relative path resolves against the session's own directory,
+    // not the location's.
+    h.facade.push({ type: "tool.input.started", sessionID: WD_SES, assistantMessageID: "m1", id: "tc1", name: "write" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: WD_SES,
+      assistantMessageID: "m1",
+      id: "tc1",
+      text: JSON.stringify({ path: "target.txt", content: AFTER }),
+    });
+    h.facade.push({
+      type: "usage.updated",
+      sessionID: WD_SES,
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    await waitForAction(h, chatURI, "chat/usage");
+    h.facade.disk.set(WD_TARGET, AFTER);
+    h.facade.push({ type: "execution.succeeded", sessionID: WD_SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+
+    const state = await changesetSnapshot(h, turnChangesetURI(chatURI, "t1"), 335);
+    expect(state!.status).toBe("ready");
+    expect(state!.files).toHaveLength(1);
+    expect(state!.files[0].id).toBe(fileUri(WD_TARGET));
+    // The snapshot refs carry the foreign absolute path.
+    const before = await resourceRead(h, { uri: snapContentRef(WD_SES, "t1", WD_TARGET, "before"), encoding: "utf-8" }, 336);
+    expect(before.result.data).toBe(BEFORE);
+    h.stop();
+  });
 });
 
 describe("resourceRead", () => {
@@ -1821,6 +2107,156 @@ describe("resourceRead", () => {
     }
     h.stop();
   });
+
+  it("reads a file:// inside a live session's own working directory", async () => {
+    const h = makeHarness();
+    await ready(h);
+    // A second session pinned to a working directory outside the location.
+    await createSession(h, 1, sessionChannelURI("ses_wd"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OTHER)],
+    }, 360);
+    const other = `${OTHER}/readme.txt`;
+    h.facade.disk.set(other, "other\n");
+    const ok = await resourceRead(h, { uri: fileUri(other), encoding: "utf-8" }, 361);
+    expect(ok.result).toEqual({ data: "other\n", encoding: "utf-8" });
+    // A path in neither the location nor any live session's directory is
+    // still refused.
+    const outside = await resourceRead(h, { uri: fileUri("/etc/passwd") }, 362);
+    expect(outside.error?.code).toBe(-32009);
+    h.stop();
+  });
+});
+
+describe("resource* (resolve/list/mkdir)", () => {
+  async function ready(h: Harness): Promise<void> {
+    h.init(1, "c1");
+    await waitInit(h, 1);
+  }
+
+  it("resourceResolve: file metadata with size, times, and a weak etag", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const file = `${OTHER}/readme.txt`;
+    h.facade.disk.set(file, "hello\n");
+    const res = await rpc(h, "resourceResolve", { uri: fileUri(file) }, 370);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toEqual({
+      uri: fileUri(file),
+      type: "file",
+      size: 6,
+      mtime: new Date(h.facade.resourceTime).toISOString(),
+      ctime: new Date(h.facade.resourceTime).toISOString(),
+      etag: `W/"6-${h.facade.resourceTime}"`,
+    });
+    h.stop();
+  });
+
+  it("resourceResolve: a directory gets a trailing-slash directory URI", async () => {
+    const h = makeHarness();
+    await ready(h);
+    h.facade.dirs.add(OTHER);
+    const res = await rpc(h, "resourceResolve", { uri: directoryUri(OTHER) }, 371);
+    expect(res.error).toBeUndefined();
+    expect(res.result.uri).toBe(directoryUri(OTHER));
+    expect(res.result.type).toBe("directory");
+    h.stop();
+  });
+
+  it("resourceResolve: follows symlinks by default, lstats with followSymlinks:false", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const file = `${OTHER}/readme.txt`;
+    const link = `${OTHER}/link`;
+    h.facade.disk.set(file, "hello\n");
+    h.facade.symlinks.set(link, file);
+    const followed = await rpc(h, "resourceResolve", { uri: fileUri(link) }, 372);
+    expect(followed.result).toMatchObject({ uri: fileUri(file), type: "file" });
+    const lstat = await rpc(h, "resourceResolve", { uri: fileUri(link), followSymlinks: false }, 373);
+    expect(lstat.result).toMatchObject({ uri: fileUri(link), type: "symlink" });
+    h.stop();
+  });
+
+  it("resourceResolve: missing → -32008, restricted → -32009, bad/absent uri → -32602", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const missing = await rpc(h, "resourceResolve", { uri: fileUri(`${OTHER}/nope.txt`) }, 374);
+    expect(missing.error?.code).toBe(-32008);
+    const restricted = `${OTHER}/restricted`;
+    h.facade.restricted.add(restricted);
+    const denied = await rpc(h, "resourceResolve", { uri: fileUri(restricted) }, 375);
+    expect(denied.error?.code).toBe(-32009);
+    const notFile = await rpc(h, "resourceResolve", { uri: "https://example.com/x" }, 376);
+    expect(notFile.error?.code).toBe(ERROR_INVALID_PARAMS);
+    const absent = await rpc(h, "resourceResolve", {}, 377);
+    expect(absent.error?.code).toBe(ERROR_INVALID_PARAMS);
+    h.stop();
+  });
+
+  it("resourceList: entries sorted directories-first, symlinks followed", async () => {
+    const h = makeHarness();
+    await ready(h);
+    h.facade.dirs.add(OTHER);
+    h.facade.dirs.add(`${OTHER}/subdir`);
+    h.facade.disk.set(`${OTHER}/readme.txt`, "x");
+    h.facade.symlinks.set(`${OTHER}/link`, `${OTHER}/readme.txt`);
+    h.facade.symlinks.set(`${OTHER}/dangling`, `${OTHER}/missing.txt`);
+    const res = await rpc(h, "resourceList", { uri: directoryUri(OTHER) }, 378);
+    expect(res.error).toBeUndefined();
+    expect(res.result.entries).toEqual([
+      { name: "subdir", type: "directory" },
+      { name: "dangling", type: "file" },
+      { name: "link", type: "file" },
+      { name: "readme.txt", type: "file" },
+    ]);
+    h.stop();
+  });
+
+  it("resourceList: missing → -32008, not a directory → -32602, restricted → -32009", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const missing = await rpc(h, "resourceList", { uri: directoryUri(`${OTHER}/nope`) }, 379);
+    expect(missing.error?.code).toBe(-32008);
+    const file = `${OTHER}/readme.txt`;
+    h.facade.disk.set(file, "x");
+    const notDir = await rpc(h, "resourceList", { uri: fileUri(file) }, 380);
+    expect(notDir.error?.code).toBe(ERROR_INVALID_PARAMS);
+    const restricted = `${OTHER}/locked`;
+    h.facade.dirs.add(restricted);
+    h.facade.restricted.add(restricted);
+    const denied = await rpc(h, "resourceList", { uri: directoryUri(restricted) }, 381);
+    expect(denied.error?.code).toBe(-32009);
+    h.stop();
+  });
+
+  it("resourceMkdir: creates parents, an existing directory is a no-op", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const target = `${OTHER}/deep/dir`;
+    const res = await rpc(h, "resourceMkdir", { uri: directoryUri(target) }, 382);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toEqual({});
+    expect(h.facade.dirs.has(`${OTHER}/deep`)).toBe(true);
+    expect(h.facade.dirs.has(target)).toBe(true);
+    const again = await rpc(h, "resourceMkdir", { uri: directoryUri(target) }, 383);
+    expect(again.error).toBeUndefined();
+    expect(again.result).toEqual({});
+    h.stop();
+  });
+
+  it("resourceMkdir: onto a file → -32010, restricted parent → -32009", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const file = `${OTHER}/readme.txt`;
+    h.facade.disk.set(file, "x");
+    const ontoFile = await rpc(h, "resourceMkdir", { uri: directoryUri(file) }, 384);
+    expect(ontoFile.error?.code).toBe(-32010);
+    const restricted = `${OTHER}/locked`;
+    h.facade.restricted.add(restricted);
+    const denied = await rpc(h, "resourceMkdir", { uri: directoryUri(`${restricted}/sub`) }, 385);
+    expect(denied.error?.code).toBe(-32009);
+    h.stop();
+  });
 });
 
 describe("invokeChangesetOperation", () => {
@@ -1848,7 +2284,9 @@ describe("invokeChangesetOperation", () => {
     );
     expect(res.error).toBeUndefined();
     expect(res.result.message).toBe(`Discarded changes to ${FILE}`);
-    expect(h.facade.discardCalls).toEqual([FILE]);
+    // A location session passes no session directory (the facade defaults
+    // to the plugin's own location).
+    expect(h.facade.discardCalls).toEqual([{ path: FILE, directory: undefined }]);
     expect(h.facade.disk.get(FILE)).toBe("a\nOLD\n"); // restored from HEAD
 
     await waitForAction(h, URI(), "changeset/operationStatusChanged", (a) => a.action.status === "running");
@@ -2548,6 +2986,25 @@ describe("multi-chat", () => {
     expect(h.frames.filter((f) => f.message.method === "root/sessionAdded")).toHaveLength(1);
     h.stop();
   }, 10000);
+
+  it("createChat on a working-directories session mints the peer backend in the same location", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("mc-wd"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OTHER)],
+    }, 410);
+    await subscribe(h, 1, sessionChannelURI("mc-wd"), 411);
+    const peer = "ahp-chat:/peer-wd";
+    const res = await createChat(h, 1, { channel: sessionChannelURI("mc-wd"), chat: peer }, 412);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    // The peer backend runs in the owner's location — not the plugin's.
+    expect(h.facade.createCalls).toHaveLength(2);
+    expect(h.facade.createCalls[1]!.location).toEqual({ directory: OTHER });
+    h.stop();
+  });
 
   it("createChat with initialMessage starts the chat's first turn on the peer backend", async () => {
     const h = makeHarness();

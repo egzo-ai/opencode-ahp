@@ -23,9 +23,18 @@
  * bridge error must never take down the opencode server (R2).
  */
 import { execFile } from "node:child_process";
-import { mkdir, readFile as fsReadFile, rm, writeFile as fsWriteFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile as fsReadFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  writeFile as fsWriteFile,
+} from "node:fs/promises";
 import { dirname, isAbsolute, join, relative } from "node:path";
-import { readFileSync } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Plugin } from "@opencode/plugin";
@@ -58,8 +67,11 @@ import {
   timeStamp,
   type FacadeAgent,
   type FacadeClientTool,
+  type FacadeDirectoryEntry,
+  type FacadeDiffFile,
   type FacadeModel,
   type FacadeModelRef,
+  type FacadeResourceInfo,
   type FacadeSession,
   type OpencodeFacade,
 } from "./bridge.js";
@@ -240,6 +252,12 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
     // Durable, core-opaque metadata: the host reads its
     // `opencode-ahp` chat-binding marker from it on external registration.
     ...(isRecord(info.metadata) ? { metadata: info.metadata as Record<string, unknown> } : {}),
+    // The location the session lives in — its directory is where the
+    // session's agent has tool access (≠ the plugin's own location when
+    // the session was created with `workingDirectories` or elsewhere).
+    ...(info.location !== undefined && info.location !== null
+      ? { location: { directory: String(info.location.directory) } }
+      : {}),
     time: { created: info.time.created, updated: info.time.updated },
   };
 }
@@ -280,6 +298,156 @@ function repoRelative(root: string, absPath: string): string | null {
 
 function isEnoent(err: unknown): boolean {
   return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+/**
+ * Cross-location working diff. `ctx.vcs.diff` is pinned to the plugin's
+ * own location (core's `Vcs` service is a location node), but sessions
+ * can now live in other directories — so for any other directory the
+ * facade shells out to `git` directly, mirroring core's git-adapter
+ * semantics: tracked-vs-HEAD `name-status` plus the `??` entries of a
+ * full `status` (untracked files), `numstat` line counts, and — for
+ * added files, which numstat does not cover — an in-process line count.
+ * Commands run with `cwd` = the directory and pathspec `-- .`, so the
+ * listing is scoped to that subtree; git emits repo-root-relative
+ * paths, which are joined onto the repo root. Any failure → `[]` (R2).
+ */
+async function gitWorkingDiff(dir: string): Promise<FacadeDiffFile[]> {
+  const root = await gitRepoRoot(dir);
+  if (root === null) return []; // not a git repo → no working diff
+  try {
+    // Run with `cwd` = the directory and pathspec `-- .`: the listing is
+    // scoped to that subtree, and git emits repo-root-relative paths
+    // (verified against git 2.47 — independent of cwd / relativePaths).
+    const hasHead = await gitHasHead(dir);
+    const items: { file: string; code: string }[] = [];
+    if (hasHead) {
+      // Tracked changes vs HEAD: `name-status -z` is null-delimited
+      // code, file, code, file, … pairs (core `diffNames`).
+      const pairs = (
+        await git(dir, ["diff", "--no-ext-diff", "--no-renames", "--name-status", "-z", "HEAD", "--", "."])
+      )
+        .split("\0")
+        .filter(Boolean);
+      for (let i = 0; i + 1 < pairs.length; i += 2) {
+        const code = pairs[i];
+        const file = pairs[i + 1];
+        if (code && file) items.push({ file, code });
+      }
+      // Untracked files (`??`) — the tracked diff never sees them.
+      for (const item of (
+        await git(dir, ["status", "--porcelain=v1", "--untracked-files=all", "--no-renames", "-z", "--", "."])
+      ).split("\0")) {
+        if (item.length < 4) continue;
+        const code = item.slice(0, 2);
+        const file = item.slice(3);
+        if (code === "??" && file) items.push({ file, code });
+      }
+      // Line counts for tracked changes (untracked files are counted below).
+      const stats = new Map<string, { additions: number; deletions: number }>();
+      for (const item of (
+        await git(dir, ["diff", "--no-ext-diff", "--no-renames", "--numstat", "-z", "HEAD", "--", "."])
+      ).split("\0")) {
+        const a = item.indexOf("\t");
+        const b = item.indexOf("\t", a + 1);
+        if (a === -1 || b === -1) continue;
+        const file = item.slice(b + 1);
+        if (!file) continue;
+        stats.set(file, {
+          additions: gitNumstatCount(item.slice(0, a)),
+          deletions: gitNumstatCount(item.slice(a + 1, b)),
+        });
+      }
+      const out: FacadeDiffFile[] = [];
+      for (const item of items) {
+        const status = gitKind(item.code);
+        const stat = stats.get(item.file);
+        if (status === "added" && stat === undefined) {
+          // Untracked (or newly added): numstat has no entry for it —
+          // count the file's lines in-process (0 when unreadable).
+          out.push({
+            path: join(root, item.file),
+            additions: await countLines(join(root, item.file)),
+            deletions: 0,
+            status,
+          });
+        } else {
+          out.push({
+            path: join(root, item.file),
+            additions: stat?.additions ?? 0,
+            deletions: stat?.deletions ?? 0,
+            status,
+          });
+        }
+      }
+      return out;
+    }
+    // No HEAD commit (fresh repo): the full status list IS the working
+    // diff; added files get an in-process line count, everything else 0/0.
+    const out: FacadeDiffFile[] = [];
+    for (const item of (
+      await git(dir, ["status", "--porcelain=v1", "--untracked-files=all", "--no-renames", "-z", "--", "."])
+    ).split("\0")) {
+      if (item.length < 4) continue;
+      const code = item.slice(0, 2);
+      const file = item.slice(3);
+      if (!file) continue;
+      const status = gitKind(code);
+      out.push({
+        path: join(root, file),
+        additions: status === "added" ? await countLines(join(root, file)) : 0,
+        deletions: 0,
+        status,
+      });
+    }
+    return out;
+  } catch {
+    return []; // R2: degrade to empty, never throw
+  }
+}
+
+/** The change kind of a git status/name-status code (core `kind()`). */
+function gitKind(code: string): FacadeDiffFile["status"] {
+  if (code === "??") return "added";
+  if (code.includes("U")) return "modified";
+  if (code.includes("A") && !code.includes("D")) return "added";
+  if (code.includes("D") && !code.includes("A")) return "deleted";
+  return "modified";
+}
+
+/** A `numstat` count field: `-` (binary) reads as 0 (core `count()`). */
+function gitNumstatCount(value: string): number {
+  const parsed = value === "-" ? 0 : Number.parseInt(value || "0", 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Whether the repo at `dir` has a HEAD commit (core `hasHead()`). */
+async function gitHasHead(dir: string): Promise<boolean> {
+  try {
+    await git(dir, ["rev-parse", "--verify", "HEAD"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The number of lines in a text file (newline count), streamed — used
+ * for the line counts of added files, which `git diff --numstat` does
+ * not report. 0 on any read failure (R2).
+ */
+async function countLines(absPath: string): Promise<number> {
+  try {
+    let lines = 0;
+    for await (const chunk of createReadStream(absPath)) {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+      const matches = text.match(/\n/g);
+      if (matches !== null) lines += matches.length;
+    }
+    return lines;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -391,6 +559,7 @@ function implementFacade(
       agent?: string;
       model?: FacadeModelRef;
       metadata?: Record<string, unknown>;
+      location?: { directory: string };
     }) {
       const info = await ctx.session.create({
         ...(input?.id !== undefined ? { id: input.id } : {}),
@@ -411,6 +580,12 @@ function implementFacade(
         // metadata is JSON by the Session.Metadata schema; the facade keeps
         // it unknown-typed, so the single cast lives here.
         ...(input?.metadata !== undefined ? { metadata: input.metadata as SessionCreateMetadata } : {}),
+        // Target location (opencode v2: boots the target location on
+        // first use). Absent → the plugin's own location (the plugin
+        // host fills in its own `location.directory`).
+        ...(input?.location !== undefined
+          ? { location: { directory: input.location.directory } }
+          : {}),
       });
       return mapSessionInfo(info);
     },
@@ -478,7 +653,13 @@ function implementFacade(
       }
     },
     // ── changesets ────────────────────────────────
-    async vcsDiffWorking() {
+    async vcsDiffWorking(directory?: string) {
+      // The plugin's own location keeps using `ctx.vcs.diff` (core's
+      // location-pinned Vcs service); any other directory uses the
+      // direct git fallback (cross-location sessions).
+      if (directory !== undefined && directory !== locationDir) {
+        return gitWorkingDiff(directory);
+      }
       const root = await gitRepoRoot(locationDir);
       if (root === null) return []; // not a git repo → no working diff
       try {
@@ -496,8 +677,9 @@ function implementFacade(
         return []; // R2: degrade to empty, never throw
       }
     },
-    async gitHeadFile(absPath: string) {
-      const root = await gitRepoRoot(locationDir);
+    async gitHeadFile(absPath: string, directory?: string) {
+      const dir = directory ?? locationDir;
+      const root = await gitRepoRoot(dir);
       if (root === null) return null;
       const rel = repoRelative(root, absPath);
       if (rel === null) return null;
@@ -517,8 +699,9 @@ function implementFacade(
     async deleteFile(absPath: string) {
       await removeFile(absPath);
     },
-    async discardFile(absPath: string) {
-      const root = await gitRepoRoot(locationDir);
+    async discardFile(absPath: string, directory?: string) {
+      const dir = directory ?? locationDir;
+      const root = await gitRepoRoot(dir);
       const rel = root !== null ? repoRelative(root, absPath) : null;
       if (root === null || rel === null) {
         await removeFile(absPath); // not in a repo → just delete
@@ -535,6 +718,64 @@ function implementFacade(
       } catch {
         await removeFile(absPath); // in the index but not in HEAD → delete
       }
+    },
+    // ── resources ─────────────────────────────────
+    // Direct filesystem access for the `resource*` commands (the folder
+    // picker's existence check + listing, `resourceMkdir`). Errors are the
+    // underlying Node `ErrnoException` — the host maps the `code` to the
+    // AHP error codes. No location confinement: the AHP surface is
+    // token-authenticated and the client may reference any path it can
+    // name (matching the VS Code reference agent host).
+    async resolveResource(absPath: string, followSymlinks?: boolean): Promise<FacadeResourceInfo> {
+      if (followSymlinks === false) {
+        // `lstat` semantics: stat the path itself — a symlink reports as
+        // a `symlink`, otherwise its own kind.
+        const s = await lstat(absPath);
+        return {
+          path: absPath,
+          type: s.isSymbolicLink() ? "symlink" : s.isDirectory() ? "directory" : "file",
+          size: s.size,
+          mtime: s.mtimeMs,
+          ctime: s.ctimeMs,
+        };
+      }
+      const real = await realpath(absPath); // throws ENOENT/EACCES/… on failure
+      const s = await stat(real);
+      return {
+        path: real,
+        type: s.isDirectory() ? "directory" : "file",
+        size: s.size,
+        mtime: s.mtimeMs,
+        ctime: s.ctimeMs,
+      };
+    },
+    async listDirectory(absPath: string): Promise<readonly FacadeDirectoryEntry[]> {
+      // `readdir` throws ENOENT (missing), ENOTDIR (not a directory), or
+      // EACCES (inaccessible) — the host maps each to the right AHP code.
+      const names = await readdir(absPath);
+      const entries: FacadeDirectoryEntry[] = [];
+      for (const name of names) {
+        let type: "file" | "directory" = "file";
+        try {
+          // `stat` follows symlinks: a symlink-to-directory lists as a
+          // directory, a dangling symlink as a file.
+          type = (await stat(join(absPath, name))).isDirectory() ? "directory" : "file";
+        } catch {
+          type = "file"; // unstat'able → file (the name still lists)
+        }
+        entries.push({ name, type });
+      }
+      // Directories first, then by name (plain code-unit compare).
+      entries.sort((a, b) => {
+        if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+        return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+      });
+      return entries;
+    },
+    async mkdirResource(absPath: string): Promise<void> {
+      // `mkdir -p`: an existing directory is a no-op success. A path
+      // occupied by a non-directory throws EEXIST (→ AlreadyExists).
+      await mkdir(absPath, { recursive: true });
     },
     // ── client-provided tools ───────
     async syncClientTools(tools: readonly FacadeClientTool[]) {

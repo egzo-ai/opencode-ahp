@@ -38,9 +38,9 @@
  * `root/activeSessionsChanged` is a sequencer action.
  *
  * Module layout: this file only composes the host — the section classes
- * (host-base.ts → host-changesets.ts → host-terminals.ts → host-turns.ts →
- * host-client-tools.ts → host-chats.ts → host-sessions.ts → host-dispatch.ts →
- * host-events.ts → host-rpc.ts) form a linear chain, each extending the
+ * (host-base.ts → host-changesets.ts → host-resources.ts → host-terminals.ts
+ * → host-turns.ts → host-client-tools.ts → host-chats.ts → host-sessions.ts
+ * → host-dispatch.ts → host-events.ts → host-rpc.ts) form a linear chain, each extending the
  * previous one; shared state lives in HostBase, and a section may only
  * call members declared at or below it in the chain (that is what keeps
  * the split type-safe).

@@ -111,6 +111,14 @@ export interface SessionRecord {
   defaultChatURI: string;
   /** The session-kind changeset store (owned by the session channel). */
   sessionChangesets: Map<string, ChangesetStateStore>;
+  /**
+   * The directory the session's agent has tool access to (its
+   * `workingDirectories` first entry, or the location directory the
+   * session was created in). `undefined` for legacy sessions created
+   * before working-directory support — they behave as if they live in
+   * the location directory.
+   */
+  directory?: string;
 }
 
 /**

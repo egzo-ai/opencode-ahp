@@ -8,6 +8,7 @@ import { ChannelRegistry, ChannelKind, ROOT_CHANNEL, channelKind, parseChangeset
 import { Sequencer } from "./seq.js";
 import { createChangesetStateStore, createRootStateStore, ChangesetStateStore, RootStateStore } from "./state.js";
 import { SocketState, ClientRecord, ChatRuntime, SessionRecord, TerminalRecord, HostOptions } from "./host-types.js";
+import { isPathInside } from "./host-util.js";
 
 export class HostBase {
   protected readonly seq: Sequencer;
@@ -213,6 +214,40 @@ export class HostBase {
     return this.opts.defaultDirectory !== undefined ? [directoryUri(this.opts.defaultDirectory)] : undefined;
   }
 
+  /**
+   * The AHP `workingDirectories` this record's session carries
+   * (`SessionMetadata.workingDirectories`): the session's own working
+   * directory (`rec.directory`), falling back to the location directory
+   * for legacy records without one. VS Code groups its session list by
+   * this workspace (the folder name, host-suffixed for remote hosts);
+   * sessions without it fall into the "Unknown" bucket. `undefined` when
+   * neither the record nor the location carries a directory.
+   */
+  protected workingDirectoriesOf(rec: SessionRecord): string[] | undefined {
+    const dir = rec.directory ?? this.opts.defaultDirectory;
+    return dir !== undefined ? [directoryUri(dir)] : undefined;
+  }
+
+  /**
+   * The session directory containing `absPath` — the confinement
+   * boundary for `resourceRead` file targets and `head` content refs.
+   * The location directory is checked first, then each live session's
+   * own directory; the first directory that contains the path wins.
+   * `undefined` when nothing contains the path (the caller answers
+   * -32009, permission denied).
+   */
+  protected containingSessionDir(absPath: string): string | undefined {
+    const candidates: string[] = [];
+    if (this.opts.defaultDirectory !== undefined) candidates.push(this.opts.defaultDirectory);
+    for (const rec of this.sessions.values()) {
+      if (rec.directory !== undefined && !candidates.includes(rec.directory)) candidates.push(rec.directory);
+    }
+    for (const dir of candidates) {
+      if (isPathInside(absPath, dir)) return dir;
+    }
+    return undefined;
+  }
+
   /** The denormalized `SessionSummary` view of a record. */
   protected sessionSummary(rec: SessionRecord): SessionSummary {
     const s = rec.sessionStore.state;
@@ -238,7 +273,7 @@ export class HostBase {
       modifiedAt,
       chats,
       defaultChat: rec.defaultChatURI,
-      workingDirectories: this.workingDirectories(),
+      workingDirectories: this.workingDirectoriesOf(rec),
     });
   }
 

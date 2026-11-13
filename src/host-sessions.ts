@@ -3,13 +3,15 @@
  */
 
 import { HostChats } from "./host-chats.js";
+import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ActionType, SessionStatus, ResolveSessionConfigResult, SessionActiveClient, SessionSummary } from "@microsoft/agent-host-protocol";
 import { agentDirectoryCustomization, chatChangesetCatalog, chatSummaryOf, directoryUri, initialSessionState, mapAgentCustomizations, sessionChangesetCatalog, FacadeSession } from "./bridge.js";
 import { ROOT_CHANNEL, channelKind, chatChannelURI, sessionChannelURI, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { createSessionStateStore } from "./state.js";
-import { ERROR_NO_PROVIDER, ERROR_SESSION_EXISTS } from "./host-errors.js";
+import { ERROR_INTERNAL, ERROR_NO_PROVIDER, ERROR_SESSION_EXISTS } from "./host-errors.js";
 import { RpcMessage, SessionRecord } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, AHP_METADATA_KEY, parseAhpMarker, errorMessage, firstEnabledModelRef, normalizeActiveClient } from "./host-util.js";
 
@@ -21,10 +23,18 @@ export class HostSessions extends HostChats {
    * `createSession` (AHP 1.0.0 session-channel command). Creates a real
    * opencode session, seeds its session/chat stores, publishes the
    * session-channel lifecycle actions, announces the session on the root
-   * channel, and responds `null` (per the command contract).
+   * channel, and responds `null` (per the command contract). The
+   * optional `workingDirectories` first entry (a `file://` URI) targets
+   * that directory's opencode location — the session's agent gets tool
+   * access there; without it the session runs in the plugin's own
+   * location (no multipleWorkingDirectories capability: extras are
+   * ignored).
    *
-   * Error codes: -32002 (no agent for the requested provider),
-   * -32003 (the session URI already exists).
+   * Error codes: -32602 (invalid params, including `workingDirectories`),
+   * -32002 (no agent for the requested provider),
+   * -32003 (the session URI already exists),
+   * -32603 (backend session creation failure, e.g. the target location
+   * cannot be booted).
    */
   protected async handleCreateSession(socketId: number, msg: RpcMessage): Promise<void> {
     const params = isRecord(msg.params) ? msg.params : {};
@@ -82,20 +92,82 @@ export class HostSessions extends HostChats {
       activeClients = [normalizeActiveClient(ac)];
     }
 
+    // `workingDirectories` (AHP 1.0.0): the directory the session's
+    // agent is granted tool access to. The host advertises no
+    // multipleWorkingDirectories, so the spec applies — only the first
+    // entry is honored (extras are logged and ignored); it must be a
+    // `file://` URI. Absent → the session runs in the plugin's own
+    // location (opencode fills in the location). A directory that does
+    // not exist is rejected when opencode boots the target location —
+    // the createSession call below fails with a message.
+    let sessionDir: string | undefined;
+    const wdParam = params["workingDirectories"];
+    if (wdParam !== undefined) {
+      if (!Array.isArray(wdParam) || wdParam.length === 0) {
+        this.sendError(
+          socketId,
+          msg.id,
+          ERROR_INVALID_PARAMS,
+          "createSession `workingDirectories` must be a non-empty array of file URIs",
+        );
+        return;
+      }
+      if (wdParam.length > 1) {
+        this.log(
+          `createSession: ignoring ${wdParam.length - 1} extra workingDirectories (no multipleWorkingDirectories capability)`,
+        );
+      }
+      const first = wdParam[0];
+      if (typeof first !== "string" || first.length === 0) {
+        this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createSession `workingDirectories`[0] must be a file URI");
+        return;
+      }
+      let dir: string;
+      try {
+        dir = fileURLToPath(first);
+      } catch {
+        this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `createSession \`workingDirectories\`[0] is not a file URI: ${first}`);
+        return;
+      }
+      // A directory URI may carry a trailing slash (RFC 8089) — drop it
+      // so the record's directory is the plain path.
+      if (dir.length > 1 && dir.endsWith("/")) dir = dir.slice(0, -1);
+      if (dir.length === 0 || !isAbsolute(dir)) {
+        this.sendError(
+          socketId,
+          msg.id,
+          ERROR_INVALID_PARAMS,
+          `createSession \`workingDirectories\`[0] is not an absolute file URI: ${first}`,
+        );
+        return;
+      }
+      sessionDir = dir;
+    }
+
     // opencode SessionIDs must start with "ses": pass the suffix through
     // only when it already is one; otherwise let opencode mint an id and
     // record the suffix→id mapping (the record key is the opencode id).
     const passID = suffix.startsWith("ses") ? suffix : undefined;
-    const created = await this.opts.facade.createSession({
-      id: passID,
-      model,
-      // Durability: a minted-id default backend carries
-      // the client-chosen session channel in its opencode metadata —
-      // after a restart the session resurfaces under the ORIGINAL channel
-      // instead of its opencode id (a "ses" suffix IS the opencode id and
-      // needs no marker).
-      ...(passID === undefined ? { metadata: { [AHP_METADATA_KEY]: { channel } } } : {}),
-    });
+    let created;
+    try {
+      created = await this.opts.facade.createSession({
+        id: passID,
+        model,
+        // Durability: a minted-id default backend carries
+        // the client-chosen session channel in its opencode metadata —
+        // after a restart the session resurfaces under the ORIGINAL channel
+        // instead of its opencode id (a "ses" suffix IS the opencode id and
+        // needs no marker).
+        ...(passID === undefined ? { metadata: { [AHP_METADATA_KEY]: { channel } } } : {}),
+        // A `workingDirectories` first entry targets that directory's
+        // location (opencode boots it on first use); absent → the plugin's
+        // own location (the plugin host fills it in).
+        ...(sessionDir !== undefined ? { location: { directory: sessionDir } } : {}),
+      });
+    } catch (err) {
+      this.sendError(socketId, msg.id, ERROR_INTERNAL, `failed to create the session: ${errorMessage(err)}`);
+      return;
+    }
 
     // Slow-create race: the pump may have registered this opencode session
     // under its own id as an external session while `createSession` was in
@@ -115,9 +187,12 @@ export class HostSessions extends HostChats {
     }
 
     const agents = await this.opts.facade.listAgents();
+    // The directory customization advertises the session's own working
+    // directory — the location directory for a session without one.
+    const agentDir = sessionDir ?? this.opts.defaultDirectory;
     const customizations =
-      mapAgentCustomizations(agents).length > 0 && this.opts.defaultDirectory !== undefined
-        ? [agentDirectoryCustomization(this.opts.defaultDirectory, agents)]
+      mapAgentCustomizations(agents).length > 0 && agentDir !== undefined
+        ? [agentDirectoryCustomization(agentDir, agents)]
         : undefined;
     const now = new Date().toISOString();
     const sessionStore = createSessionStateStore(
@@ -127,7 +202,7 @@ export class HostSessions extends HostChats {
         title: created.title ?? "New Session",
         activeClients,
         customizations,
-        workingDirectories: this.workingDirectories(),
+        workingDirectories: sessionDir !== undefined ? [directoryUri(sessionDir)] : this.workingDirectories(),
       }),
     );
     const rec: SessionRecord = {
@@ -142,6 +217,7 @@ export class HostSessions extends HostChats {
       chats: new Map(),
       defaultChatURI: chatChannelURI(created.sessionID),
       sessionChangesets: new Map(),
+      ...(sessionDir !== undefined ? { directory: sessionDir } : {}),
     };
     this.sessions.set(created.sessionID, rec);
     this.byChannel.set(channel, rec);
@@ -244,10 +320,12 @@ export class HostSessions extends HostChats {
    * agent/model choice rides session-state customizations and the
    * per-turn message — so the honest answer is an empty schema with
    * empty values. `provider` / `workingDirectory` / `config` are
-   * accepted and deliberately unused: sessions run in the location
-   * directory and the host advertises no config properties (which also
-   * keeps `sessionConfigCompletions` unreachable — it only serves
-   * `enumDynamic` properties this schema does not carry).
+   * accepted and deliberately unused: a session's working directory
+   * comes from `createSession`'s `workingDirectories` (the location
+   * directory when absent), and the host advertises no config
+   * properties (which also keeps `sessionConfigCompletions` unreachable
+   * — it only serves `enumDynamic` properties this schema does not
+   * carry).
    */
   protected handleResolveSessionConfig(socketId: number, msg: RpcMessage): void {
     const params = isRecord(msg.params) ? msg.params : {};
@@ -455,6 +533,9 @@ export class HostSessions extends HostChats {
   private registerExternalStandalone(fs: FacadeSession, channel?: string): SessionRecord {
     const recChannel = channel ?? sessionChannelURI(fs.sessionID);
     const modifiedAt = new Date(fs.time.updated).toISOString();
+    // The session's own location (a cross-location session — created with
+    // `workingDirectories` or elsewhere) — its working directory.
+    const sessionDir = fs.location?.directory;
     const sessionStore = createSessionStateStore(
       initialSessionState({
         sessionID: fs.sessionID,
@@ -463,7 +544,7 @@ export class HostSessions extends HostChats {
         status: fs.archived
           ? ((SessionStatus.Idle | SessionStatus.IsRead | SessionStatus.IsArchived) as SessionStatus)
           : undefined, // Idle | IsRead | IsArchived
-        workingDirectories: this.workingDirectories(),
+        workingDirectories: sessionDir !== undefined ? [directoryUri(sessionDir)] : this.workingDirectories(),
       }),
     );
     const rec: SessionRecord = {
@@ -476,6 +557,7 @@ export class HostSessions extends HostChats {
       chats: new Map(),
       defaultChatURI: chatChannelURI(fs.sessionID),
       sessionChangesets: new Map(),
+      ...(sessionDir !== undefined ? { directory: sessionDir } : {}),
     };
     this.sessions.set(fs.sessionID, rec);
     this.byChannel.set(recChannel, rec);

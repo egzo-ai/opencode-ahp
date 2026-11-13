@@ -327,15 +327,31 @@ Requests (methods with an `id`) routed by the host:
 | `dispatchAction` | Notification. See [§9](#9-client-dispatchable-actions). |
 | `listSessions` | All opencode sessions, most-recently-modified first, in-memory cursor pagination (`limit` default 100, `cursor` = offset). Unknown sessions are **lazily registered** (idempotent per opencode id) so their channels become subscribable. |
 | `resolveSessionConfig` | An honest empty schema (`{ type: "object", properties: {} }`, `values: {}`) — opencode collects no session-creation configuration; agent/model choice rides session customizations and the per-turn message. `provider`/`workingDirectory`/`config` params are accepted and ignored. VS Code calls this strictly before the first send of a new session, so an unimplemented host makes every fresh session unstartable. |
-| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32002` (no enabled provider for the requested provider), `-32003` (channel exists). |
+| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (malformed `workingDirectories` or `activeClient`), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
 | `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI; publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
 | `disposeChat` | `null`. Removes a peer chat (never the default chat) and its opencode backend session; publishes `session/chatRemoved`. AHP-side unbind happens *before* the backend removal so the racing `session.deleted` event doesn't double-publish. |
-| `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside the location. |
-| `invokeChangesetOperation` | The only operation the host offers is `discard-changes` (resource-scoped). See [§11.4](#114-discard-changes). |
+| `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory or one of the live sessions' own working directories), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside every session's working directory. |
+| `resourceResolve` | Metadata for one filesystem `file://` URI: canonical URI (directories end in `/`), `type` (`file` / `directory` / `symlink`), `size`, ISO `mtime`/`ctime`, and a weak etag `W/"<size>-<mtimeMs>"`. `followSymlinks` defaults to true (realpath + stat); `false` lstats the path itself (a link reports as `symlink`). This is the existence check VS Code's remote folder picker runs before accepting a path. Errors: `-32008` not found, `-32009` permission denied, `-32602` not a file URI, `-32603` other. |
+| `resourceList` | Immediate entries of a directory `file://` URI as `{ name, type: file \| directory }` — directories first, then by name. Symlinks are followed for the type (a link to a directory lists as a directory; a dangling link as a file). The target must exist and be a directory: errors `-32008` (missing), `-32602` (not a directory), `-32009` (inaccessible). This is what the folder picker navigates with. |
+| `resourceMkdir` | Creates a directory with `mkdir -p` semantics (parents as needed; an existing directory is a no-op success); result `{}`. Errors: `-32010` the path exists as a non-directory, `-32009` permission denied, `-32602` not a file URI, `-32603` other. |
+| `invokeChangesetOperation` | The only operation the host offers is `discard-changes` (resource-scoped), on a live changeset; it targets the changeset's owning session's directory. See [§11.4](#114-discard-changes). |
 | `createTerminal` | `null`. Spawns an interactive pty shell (`spawnPty` seam — Bun in production) in the resolved working directory and registers the client-chosen channel. Params: `channel` (client-chosen; the host namespace, including the reserved `ahp-terminal:` prefix, is refused), `claim` (a client claim for the dispatching client, or a session claim), `name?`, `cwd?`, `cols?`/`rows?` (defaults 80×24). The `cwd` accepts plain `file://` (what VS Code sends), the client's `vscode-agent-host:`/`agent-host:` wrapper, or a bare absolute path; anything malformed or outside the location directory clamps to the location directory. Errors: `-32601` (capability off, or the runtime cannot spawn ptys), `-32600` (host-namespace channel), `-32010` (AHP AlreadyExists — duplicate channel), `-32602` (malformed params), `-32603` (the spawn threw — logged, R2: the host survives). |
 | `disposeTerminal` | `null`. Kills the pty (a still-running process gets a final `terminal/exited`), drops the record, and refreshes the catalog. Idempotent: an unknown channel answers `null` (VS Code's shutdown path disposes terminals that may already be gone). Synthetic (session-owned) terminals are host-managed: `-32009` (AHP PermissionDenied). Capability off: `-32601`; missing channel: `-32602`. |
 | `setClientManagedSettingsPermissions` | Accepted and logged as a no-op — a VS Code-specific post-init notification with no AHP 1.0.0 counterpart; the connection must stay up. |
 | anything else | `-32601` for requests; unknown notifications are logged and dropped. |
+
+The filesystem `resource*` commands (`resourceRead`, `resourceResolve`,
+`resourceList`, `resourceMkdir`) are **not** location-confined: the AHP
+surface is token-authenticated, and the client may name any path it can
+resolve — matching the VS Code reference agent host, which exposes the
+whole host filesystem to a connected (i.e. authenticated) client.
+Confinement applies to *session-scoped* surfaces instead: `resourceRead`
+`file://` targets, HEAD content refs, changeset diffs, turn-snapshot
+paths, and terminal `cwd` all stay inside the location directory or the
+owning session's own working directory ([§7.3](#73-workspace-workingdirectories)).
+The facade surfaces Node `ErrnoException`s and the host maps the `code`
+to the AHP error codes (ENOENT → `-32008`, EACCES/EPERM → `-32009`,
+ENOTDIR → `-32602`, EEXIST → `-32010`, other → `-32603`).
 
 JSON-RPC plumbing: malformed JSON → `-32700`; not a 2.0 request object →
 `-32600`; an unhandled router error → `-32603` (logged) — a bad frame
@@ -402,15 +418,45 @@ data stays reachable).
 ### 7.3 Workspace (`workingDirectories`)
 
 Every session the host publishes carries
-`workingDirectories: [directoryUri(location directory)]` — on the
+`workingDirectories: [directoryUri(directory)]` — on the
 `SessionState` (session-channel snapshot, via `initialSessionState`) and
 on every `SessionSummary` (root `sessionAdded` / `sessionSummaryChanged`
-notifications and `listSessions`, via `sessionSummary`). The location
-directory is the single directory the session's agent has tool access to;
-it is the same directory the agent-directory customization points at.
-One entry only: the host advertises no `multipleWorkingDirectories`
+notifications and `listSessions`, via `sessionSummary`). The `directory`
+is the session's own working directory: the directory its agent has tool
+access to, and the same directory the agent-directory customization
+points at. It is the `workingDirectories` first entry of a
+`createSession`, the session's opencode location for externally
+registered sessions, and the location directory for sessions without
+either (records keep it as `SessionRecord.directory`; `undefined` = the
+location).
+
+`createSession` accepts the AHP `workingDirectories` param (AHP 1.0.0:
+a client MUST NOT supply more than one entry unless the agent
+advertises `multipleWorkingDirectories`, which this host does not): the
+first entry must be a non-empty absolute `file://` URI — a trailing
+slash, which RFC 8089 directory URIs may carry, is stripped, and a
+non-array or empty list, an empty entry, a non-file URI, or a relative
+path is `-32602`. Only the first entry is honored (extras are logged and
+ignored); the backend session is created with
+`location: { directory }`, which makes opencode boot that directory's
+location on first use — a directory that does not exist fails there, and
+the createSession call answers `-32603` with the boot error. Sessions
+without the param run in the plugin's own location (opencode fills the
+location in). The host advertises no `multipleWorkingDirectories`
 capability, so clients MUST NOT mutate the set (AHP working-directory
 actions are unusable).
+
+Externally registered sessions ([§7.2](#72-external-sessions)) take
+their directory from opencode's `SessionInfo.location`, so a
+cross-location session (created with `workingDirectories`, or created
+elsewhere in another location) advertises the directory it was created
+in and its session-scoped surfaces (changesets, snapshot paths, terminal
+`cwd`) are confined to it. Peer-chat backends run in the owner's
+location — a working-directories session's chats are not forked into the
+plugin's own location. Cross-location sessions are fully live-verified
+against the test server (2026-11-13): opencode boots the target location
+on the first `createSession`, the plugin's event pump sees its session
+events, and `session.list`/`get` are app-level.
 
 **Why the field is required for a usable session list (VS Code 1.145):**
 the Sessions view groups sessions into workspace sections; a
@@ -712,12 +758,13 @@ At `tool.input.ended` (fires before execution — the last safe point),
 file-mutating tools (`write`, `edit`, `apply`, `patch`) whose input
 carries a path (`path` / `file_path` / `filePath` / `file`) have the
 target file's **pre-edit content** read from disk, confined to the
-location directory; the first capture per file per turn wins, so the
-pre-turn content survives later edits in the same turn. At the turn
-terminal, each captured file's **after** content is read from disk
-(absent = deleted). These in-memory snapshots back the turn changeset
-and the `ahp-content://snap/…` content refs — kept until the chat is
-removed (discard-restore reads them).
+owning session's working directory (the location directory for sessions
+without one — a relative tool path resolves against it); the first
+capture per file per turn wins, so the pre-turn content survives later
+edits in the same turn. At the turn terminal, each captured file's
+**after** content is read from disk (absent = deleted). These in-memory
+snapshots back the turn changeset and the `ahp-content://snap/…` content
+refs — kept until the chat is removed (discard-restore reads them).
 
 ### 11.3 Computation & content
 
@@ -726,13 +773,23 @@ removed (discard-restore reads them).
 `discard-changes` operation is (re)attached while files exist and cleared
 when they vanish), then `changeset/statusChanged` to `ready`. A failed
 computation publishes `statusChanged` with an error. The uncommitted and
-session kinds compute from the working-tree diff (`ctx.vcs.diff` mode
-working, untracked included, joined to the git root); the turn kind
-computes from the chat's snapshots.
+session kinds compute from the working-tree diff — in the session's own
+working directory (the location directory for sessions without one),
+untracked included, joined to the git root — and the turn kind computes
+from the chat's snapshots. `ctx.vcs.diff` is location-fixed (the core
+Vcs service is a location node, and the plugin host exposes no location
+input), so a session whose directory is not the plugin's location falls
+back to a direct git diff in the facade (`gitWorkingDiff`): the same
+semantics as the core git adapter — `git diff --name-status/-z HEAD` +
+`git status --porcelain=v1 -z` (untracked), `--numstat` for line counts,
+run with the session directory as cwd and a `-- .` pathspec (the output
+paths are repo-root-relative regardless of cwd — verified against git
+2.47.3, 2026-11-13). Any git failure yields an empty diff (R2).
 
 File content is served via `resourceRead` from three URI forms:
 
-- `file://` — live disk, confined to the location directory;
+- `file://` — live disk, confined to the location directory or one of
+  the live sessions' own working directories;
 - `ahp-content://head/<b64url(absPath)>` — the file's content at git HEAD
   (`git show HEAD:`);
 - `ahp-content://snap/<b64url(sessionID)>/<b64url(turnId)>/<b64url(absPath)>/before|after` —
@@ -748,13 +805,15 @@ path — malformed segments fail to parse (`-32008`).
 ### 11.4 `discard-changes`
 
 `invokeChangesetOperation` accepts exactly one operation:
-`discard-changes`, resource-scoped, on a live changeset. It publishes
-`changeset/operationStatusChanged` (running), restores the file — for a
-turn changeset from the before-snapshot (a file the turn added is
-deleted), otherwise via `git checkout HEAD -- <file>` (untracked files
-are deleted instead) — refreshes the changeset, publishes the status
-`idle`, and returns a human-readable message. Errors publish status
-`error` and the RPC error.
+`discard-changes`, resource-scoped, on a live changeset; the target path
+must lie inside the changeset's owning session's working directory (the
+location directory for sessions without one — otherwise `-32009`). It
+publishes `changeset/operationStatusChanged` (running), restores the
+file — for a turn changeset from the before-snapshot (a file the turn
+added is deleted), otherwise via `git checkout HEAD -- <file>` (untracked
+files are deleted instead) — in the session's directory, refreshes the
+changeset, publishes the status `idle`, and returns a human-readable
+message. Errors publish status `error` and the RPC error.
 
 ### 11.5 Teardown
 
@@ -848,9 +907,12 @@ session opens an interactive terminal; a host that refuses
   Code sends — it unwraps its own wrapper before the wire), the client's
   `vscode-agent-host:`/`agent-host:` wrapper (URI path, with the `_ah`
   urlsafe-base64 meta path winning when present), or a bare absolute
-  path. Anything malformed, and anything outside the location directory,
-  clamps to the location directory: the shell is a tool of the session's
-  agent and must not spawn outside its working root.
+  path. The confinement boundary is the session's own working directory
+  when the claim names a session that has one (a cross-location
+  session's terminal opens there, not in the plugin's location) and the
+  location directory otherwise. Anything malformed, and anything outside
+  the boundary, clamps to the boundary: the shell is a tool of the
+  session's agent and must not spawn outside its working root.
 - **State & lifecycle.** The seed has `isPty: true`, the (resolved)
   directory `cwd`, the requested `cols`/`rows` (default 80×24), the
   requested `name` (default "Shell"), the creating client's claim, and a

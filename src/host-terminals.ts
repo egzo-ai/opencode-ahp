@@ -12,7 +12,7 @@
  */
 
 import { fileURLToPath } from "node:url";
-import { HostChangesets } from "./host-changesets.js";
+import { HostResources } from "./host-resources.js";
 import {
   ActionOrigin,
   ActionType,
@@ -137,7 +137,7 @@ function unwrapAgentHostCwd(raw: string): string | null {
   return url.pathname.length > 0 ? url.pathname : null;
 }
 
-export class HostTerminals extends HostChangesets {
+export class HostTerminals extends HostResources {
   // ── pty terminals (createTerminal / disposeTerminal) ─────────────────
 
   /**
@@ -195,7 +195,12 @@ export class HostTerminals extends HostChangesets {
       this.sendError(socketId, msg.id, ERROR_METHOD_NOT_FOUND, "interactive terminal spawning is unavailable in this runtime");
       return;
     }
-    const cwd = this.resolveTerminalCwd(typeof params["cwd"] === "string" ? params["cwd"] : undefined);
+    // A session claim scopes the cwd to that session's own working
+    // directory (a cross-location session's terminal opens there, not in
+    // the plugin's location); a client claim falls back to the location.
+    const sessionDir =
+      claim.kind === TerminalClaimKind.Session ? this.byChannel.get(claim.session)?.directory : undefined;
+    const cwd = this.resolveTerminalCwd(typeof params["cwd"] === "string" ? params["cwd"] : undefined, sessionDir);
     const cols = positiveInt(params["cols"]) ?? 80;
     const rows = positiveInt(params["rows"]) ?? 24;
     const name = typeof params["name"] === "string" && params["name"].length > 0 ? params["name"] : undefined;
@@ -284,16 +289,22 @@ export class HostTerminals extends HostChangesets {
 
   /**
    * Resolve a `createTerminal` cwd to an absolute path inside the
-   * location directory. Accepted: a plain `file://` URI (what the VS
-   * Code client sends — it unwraps its own wrapper before the wire), the
-   * client's `vscode-agent-host:`/`agent-host:` wrapper (supported for
+   * session's working directory (a claimed terminal is scoped to its
+   * session; a client-claimed one to the location directory). Accepted:
+   * a plain `file://` URI (what the VS Code client sends — it unwraps
+   * its own wrapper before the wire), the client's
+   * `vscode-agent-host:`/`agent-host:` wrapper (supported for
    * robustness), and a bare absolute path. Anything malformed — and
-   * anything outside the location directory — falls back to the location
-   * directory: the shell is a tool of the session's agent and must not
-   * be spawned outside its working root.
+   * anything outside that boundary — falls back to it: the shell is a
+   * tool of the session's agent and must not be spawned outside its
+   * working root.
    */
-  protected resolveTerminalCwd(raw: string | undefined): string {
-    const fallback = this.opts.defaultDirectory ?? process.cwd();
+  protected resolveTerminalCwd(raw: string | undefined, sessionDir?: string): string {
+    // The clamp boundary (and the fallback when no cwd is given) is the
+    // session's own working directory — the location directory for legacy
+    // sessions or a client-claimed terminal.
+    const boundary = sessionDir ?? this.opts.defaultDirectory;
+    const fallback = boundary ?? process.cwd();
     if (raw === undefined || raw.length === 0) return fallback;
     let path: string | null = null;
     if (raw.startsWith("file://")) {
@@ -311,8 +322,8 @@ export class HostTerminals extends HostChangesets {
       this.log(`terminal cwd ${raw} is not a usable path; falling back to ${fallback}`);
       return fallback;
     }
-    if (this.opts.defaultDirectory !== undefined && !isPathInside(path, this.opts.defaultDirectory)) {
-      this.log(`terminal cwd ${path} is outside the location directory; clamping to ${fallback}`);
+    if (boundary !== undefined && !isPathInside(path, boundary)) {
+      this.log(`terminal cwd ${path} is outside the session's working directory; clamping to ${fallback}`);
       return fallback;
     }
     return path;

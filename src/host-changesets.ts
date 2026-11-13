@@ -46,9 +46,13 @@ export class HostChangesets extends HostBase {
     if (!isRecord(parsed)) return;
     const rawPath = SNAPSHOT_PATH_KEYS.map((k) => parsed[k]).find((v) => typeof v === "string" && (v as string).length > 0);
     if (typeof rawPath !== "string") return;
-    const absPath = this.resolveSnapshotPath(rawPath);
+    // The owning record's directory scopes the clamp: a cross-location
+    // session's tool calls target its own working directory, not the
+    // location directory (legacy sessions resolve against the location).
+    const sessionDir = this.byOpencode.get(chat.sessionID)?.rec.directory;
+    const absPath = this.resolveSnapshotPath(rawPath, sessionDir);
     if (absPath === null) {
-      this.log(`turn snapshot: ${toolName} target ${rawPath} is outside the location directory; not captured`);
+      this.log(`turn snapshot: ${toolName} target ${rawPath} is outside the session's working directory; not captured`);
       return;
     }
     let before: string | null;
@@ -67,9 +71,13 @@ export class HostChangesets extends HostBase {
     chat.turnSnapshots.set(turnId, turnFiles);
   }
 
-  /** Resolve a tool-input path against the location directory (must stay inside it). */
-  private resolveSnapshotPath(rawPath: string): string | null {
-    const dir = this.opts.defaultDirectory;
+  /**
+   * Resolve a tool-input path against the session's working directory —
+   * its own directory, or the location directory for legacy sessions
+   * (`sessionDir` undefined) — and require it to stay inside it.
+   */
+  private resolveSnapshotPath(rawPath: string, sessionDir?: string): string | null {
+    const dir = sessionDir ?? this.opts.defaultDirectory;
     if (dir === undefined) return null;
     const absPath = resolvePath(dir, rawPath);
     return isPathInside(absPath, dir) ? absPath : null;
@@ -102,7 +110,9 @@ export class HostChangesets extends HostBase {
           reviewedById: this.reviewedById(store),
         });
       } else {
-        const diffs = await this.opts.facade.vcsDiffWorking();
+        // Per-session diff: the session's own working directory
+        // (cross-location sessions), or the location directory (legacy).
+        const diffs = await this.opts.facade.vcsDiffWorking(rec.directory);
         files = buildWorkingChangesetFiles({ diffs, reviewedById: this.reviewedById(store) });
       }
     } catch (err) {
@@ -198,8 +208,10 @@ export class HostChangesets extends HostBase {
         this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
         return;
       }
-      if (this.opts.defaultDirectory !== undefined && !isPathInside(absPath, this.opts.defaultDirectory)) {
-        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+      // Per-session confinement: the path must live in the location
+      // directory or in one of the live sessions' own working directories.
+      if (this.containingSessionDir(absPath) === undefined) {
+        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside every session's working directory");
         return;
       }
       let content: string | null;
@@ -227,13 +239,14 @@ export class HostChangesets extends HostBase {
       return;
     }
     if (ref.kind === "head") {
-      if (this.opts.defaultDirectory !== undefined && !isPathInside(ref.path, this.opts.defaultDirectory)) {
-        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+      const dir = this.containingSessionDir(ref.path);
+      if (dir === undefined) {
+        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside every session's working directory");
         return;
       }
       let content: string | null;
       try {
-        content = await this.opts.facade.gitHeadFile(ref.path);
+        content = await this.opts.facade.gitHeadFile(ref.path, dir);
       } catch (err) {
         this.sendError(socketId, msg.id, ERROR_INTERNAL, `HEAD read failed: ${errorMessage(err)}`);
         return;
@@ -323,8 +336,11 @@ export class HostChangesets extends HostBase {
       this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `no such file in changeset: ${target["resource"]}`);
       return;
     }
-    if (this.opts.defaultDirectory !== undefined && !isPathInside(absPath, this.opts.defaultDirectory)) {
-      this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+    // Confine to the session's own working directory (legacy sessions:
+    // the location directory) — the changeset's files live there.
+    const sessionDir = rec.directory ?? this.opts.defaultDirectory;
+    if (sessionDir !== undefined && !isPathInside(absPath, sessionDir)) {
+      this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the session's working directory");
       return;
     }
     this.publish({
@@ -337,7 +353,7 @@ export class HostChangesets extends HostBase {
         // (changesetStoreOf resolved it above).
         await this.restoreTurnFile(rec.chats.get(parsed.ownerUri)!, parsed.turnId, absPath);
       } else {
-        await this.opts.facade.discardFile(absPath);
+        await this.opts.facade.discardFile(absPath, rec.directory);
       }
     } catch (err) {
       this.publish({

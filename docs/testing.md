@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Nine suites, 298 tests as of 2026-11-10, a few
+(`vitest.config.ts`). Eight suites, 312 tests as of 2026-11-13, a few
 seconds wall time:
 
 ```sh
@@ -52,7 +52,7 @@ so assertions observe exactly what the unit under test used.
 | `channels.test.ts` | channel kind + session/changeset URI helpers; `ChannelRegistry`: snapshot on subscribe, broadcast targets and sockets, live sessions. |
 | `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); `mapV2EventRaw` classification (ok / dropped-with-reason / unimplemented / malformed envelopes) + the `eventLogLine`/`timeStamp` capture-line format; catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
-| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions`, the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture), `resourceRead`, `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability, terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam), `resolveSessionConfig`. |
+| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions` (including `workingDirectories` — first-entry honoring, the trailing-slash strip, malformed-URI rejection), the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture, cross-location: subscribe and before-capture diff the session's own directory, relative tool paths resolve against it), the `resource*` family (`resourceRead` — location- or session-dir confined — plus `resourceResolve`/`resourceList`/`resourceMkdir` with the errno → AHP-code mapping, symlink follow semantics, and the not-a-file-URI rejection), `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability (peer-chat backends location-aware), terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam, cwd resolution and clamping), `resolveSessionConfig`. |
 
 **Fixtures.** `src/test/fixtures/events.jsonl` holds a captured
 `V2EventEncoded` stream (one event per line, arrival order) that
@@ -211,6 +211,7 @@ host`.
 | `scripts/ahp-client-tools.mjs` | Client-provided tools through the real opencode tool registry: a `ping` tool registered via `createSession.activeClient.tools`, then three turns — happy path (client-executed contributor, single `toolCallComplete`, result in the snapshot), failed result (the model sees the error; the turn still completes), and `requiresResultConfirmation` (the call parks in `pending-result-confirmation`; approving via `chat/toolCallResultConfirmed` releases the held result). |
 | `scripts/ahp-multi-chat.mjs` | Multi-chat: the `multipleChats` capability in the root catalog, `createChat` minting a fresh opencode backend on a client-chosen URI, independent turns on both chats, the `listSessions` differential (peer backends never resurface as sessions), and reload durability with `--leave-peer` / `--recheck` across a location reload. |
 | `scripts/ahp-terminal-probe.mjs` | The pty terminal surface: `initialize` → `createTerminal` (a real shell pty on a client-chosen channel) → the root catalog row → the subscribe snapshot (`isPty`, title, size, directory cwd) → `terminal/input` (a marker command, expecting its output line back through `terminal/data` — the stream is stripped of ANSI/OSC/CSI prompt machinery first) → `terminal/resized` (state tracks it) → `disposeTerminal` (final `terminal/exited`, catalog row drops). |
+| `scripts/ahp-working-dirs.mjs` | Working directories (cross-location sessions) end to end — the surface VS Code's "add projects" drives: the `resource*` commands the folder picker uses (`resourceMkdir` creating the target itself, `resourceResolve` file/directory/symlink metadata + the not-found and non-file-URI errors, a permission probe skipped as root, `resourceList` exact sorted entries + the not-a-directory error), `createSession.workingDirectories` (trailing-slash strip, the `sessionAdded` summary + session-state `workingDirectories` + directory customization, `listSessions`, malformed-URI rejection), changeset confinement to the target's own git repo (the pre-turn before-ref is the **target's** HEAD — the decisive cross-location assertion —, `resourceRead` confined to the session's directory, the before-snapshot content), and the terminal session claim (an out-of-bounds cwd clamped to the session's own directory, verified with `pwd` through the pty stream). The target is script-owned scratch: it is removed and recreated on every run. |
 | `scripts/capture-events.mjs` | Offline fixture capture (no AHP involved): boots a scratch location, opens the server's SSE event stream, runs one small tool-using prompt, and records every V2Event envelope to `src/test/fixtures/events.jsonl` for the unit suites ([§1](#1-unit-tests-vitest)). |
 
 Usage (the token is the one from the project config):
@@ -228,11 +229,14 @@ node scripts/ahp-client-tools.mjs --token "$TOKEN" --base http://127.0.0.1:8767
 node scripts/ahp-multi-chat.mjs  --token "$TOKEN" --base http://127.0.0.1:8767
 node scripts/ahp-terminal-probe.mjs --token "$TOKEN" --base http://127.0.0.1:8767 \
   --project-dir /tmp/ahp-server/test-project
+node scripts/ahp-working-dirs.mjs --token "$TOKEN" --base http://127.0.0.1:8767 \
+  --target-dir /tmp/ahp-server/wd-probe
 ```
 
 (`ahp-changesets.mjs` also ensures its git fixture — the `notes.txt`
-baseline committed at `line1\nline2` — so it can run right after a fresh
-`scripts/ahp-server.mjs` run.)
+baseline committed at `line1\nline2` — and `ahp-working-dirs.mjs` does
+the same in its own target directory, so both can run right after a
+fresh `scripts/ahp-server.mjs` run.)
 
 **When to run them.** Changes that alter live behavior (transport, host)
 should be verified against the test server — at minimum

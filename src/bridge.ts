@@ -93,6 +93,13 @@ export interface FacadeSession {
    * restart; everything else is passed through opaquely.
    */
   metadata?: Record<string, unknown>;
+  /**
+   * The location the session lives in (opencode `SessionInfo.location`):
+   * the directory its agent has tool access to. A session created through
+   * this host with `workingDirectories` (or created elsewhere in another
+   * location) carries a directory other than the plugin's own location.
+   */
+  location?: { directory: string };
 }
 
 /** `SessionPromptInput.delivery` (steer | queue; absent = default). */
@@ -196,6 +203,11 @@ export interface OpencodeFacade {
     model?: FacadeModelRef;
     /** Durable session metadata — the host's chat-binding marker rides here. */
     metadata?: Record<string, unknown>;
+    /**
+     * The location to create the session in (opencode v2: the target
+     * location boots on first use). Absent = the plugin's own location.
+     */
+    location?: { directory: string };
   }): Promise<FacadeSession>;
   /** All opencode sessions for this location. */
   listSessions(): Promise<readonly FacadeSession[]>;
@@ -230,16 +242,17 @@ export interface OpencodeFacade {
   // ── changesets ───────────────────────────────────────────────
   /**
    * Working-tree diff vs HEAD (uncommitted changes, untracked files
-   * included), with **absolute** file paths. `[]` when the location is
+   * included), with **absolute** file paths, for `directory` (absent →
+   * the plugin's own location directory). `[]` when the directory is
    * not a git repo, has no changes, or the diff fails (R2: degrade to
    * empty, never throw).
    */
-  vcsDiffWorking(): Promise<readonly FacadeDiffFile[]>;
+  vcsDiffWorking(directory?: string): Promise<readonly FacadeDiffFile[]>;
   /**
    * The file's content in HEAD (`git show HEAD:<rel>`), or null when the
-   * location is not a repo, HEAD is missing, or the file is not tracked.
+   * repo is missing, HEAD is missing, or the file is not tracked.
    */
-  gitHeadFile(absPath: string): Promise<string | null>;
+  gitHeadFile(absPath: string, directory?: string): Promise<string | null>;
   /** Read a UTF-8 file from disk, or null when it does not exist. */
   readFile(absPath: string): Promise<string | null>;
   /** Write a UTF-8 file (creating parent directories as needed). */
@@ -247,10 +260,33 @@ export interface OpencodeFacade {
   /** Delete a file; no-op when it does not exist. */
   deleteFile(absPath: string): Promise<void>;
   /**
-   * Discard changes to one file: tracked → `git checkout HEAD -- <rel>`
-   * (fallback delete), untracked → delete.
+   * Discard changes to one file in `directory` (absent → the plugin's
+   * own location): tracked → `git checkout HEAD -- <rel>` (fallback
+   * delete), untracked → delete.
    */
-  discardFile(absPath: string): Promise<void>;
+  discardFile(absPath: string, directory?: string): Promise<void>;
+  // ── resources ─────────────────────────────────────────────────
+  /**
+   * Resolve the metadata of an absolute filesystem path for
+   * `resourceResolve`. With `followSymlinks` true (the default),
+   * symlinks are followed and `path` in the result is the canonical
+   * (realpath) path; with false the link itself is stat'd and `type` is
+   * `symlink`. Throws a Node `ErrnoException` (ENOENT/EACCES/…) on
+   * failure — the host maps the code.
+   */
+  resolveResource(absPath: string, followSymlinks?: boolean): Promise<FacadeResourceInfo>;
+  /**
+   * List one directory's entries (name + type only) for `resourceList`.
+   * Throws a Node `ErrnoException` when the path is missing, not a
+   * directory, or inaccessible.
+   */
+  listDirectory(absPath: string): Promise<readonly FacadeDirectoryEntry[]>;
+  /**
+   * Create a directory with all missing parents for `resourceMkdir`
+   * (`mkdir -p`: an existing directory is a no-op success). Throws a
+   * Node `ErrnoException` on failure.
+   */
+  mkdirResource(absPath: string): Promise<void>;
   // ── client-provided tools ─────────────────────────
   /**
    * Replace the location's registered client tools with `tools` (the
@@ -301,6 +337,26 @@ export interface FacadeDiffFile {
   additions: number;
   deletions: number;
   status: "added" | "deleted" | "modified";
+}
+
+/**
+ * The facade's shape of `resourceResolve` metadata. `path` is the
+ * canonical (realpath) path when `followSymlinks` was true; `mtime`/
+ * `ctime` are epoch milliseconds (the host formats the ISO strings).
+ */
+export interface FacadeResourceInfo {
+  path: string;
+  type: "file" | "directory" | "symlink";
+  size: number;
+  mtime: number;
+  ctime: number;
+}
+
+/** One `resourceList` entry (name + type; no size/mtime — the spec's
+ * list result does not carry them). */
+export interface FacadeDirectoryEntry {
+  name: string;
+  type: "file" | "directory";
 }
 
 // ── catalog mappers ─────────────────────────────────────────────

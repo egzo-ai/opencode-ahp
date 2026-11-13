@@ -157,6 +157,10 @@ export class HostChats extends HostClientTools {
       created = await this.opts.facade.createSession({
         model,
         metadata: { [AHP_METADATA_KEY]: { chat: chatURI, owner: rec.sessionID } },
+        // A peer backend runs in the same location as its owner (a
+        // session with a working directory must not get its chats forked
+        // into the plugin's own location).
+        ...(rec.directory !== undefined ? { location: { directory: rec.directory } } : {}),
       });
     } catch (err) {
       this.sendError(socketId, msg.id, ERROR_INTERNAL, `failed to create the chat's backend session: ${errorMessage(err)}`);

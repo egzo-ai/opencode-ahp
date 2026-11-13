@@ -194,6 +194,57 @@ becomes worth doing only once that happens.
   rejection echo. Potential, not planned: it is small, and nothing
   currently demands it.
 
+### 1.5 Multiroot sessions (`multipleWorkingDirectories`)
+
+**What it is.** AHP 1.0.0 carries an
+`AgentCapabilities.multipleWorkingDirectories` capability (options
+`immutablePrimary` / `primaryReplacement`): when advertised, a session
+owns a *set* of working directories treated as equal peers — optionally
+with a protected first slot that is immutable or atomically replaceable —
+and each chat may narrow to a subset of the session's set. Changesets are
+cross-cutting: a turn's changeset may span several of the session's
+directories, and a client that wants a per-directory view groups files
+itself. When the capability is **absent** — as it is on this host —
+clients MUST NOT mutate a session's or chat's working-directory set and
+MUST NOT set more than one entry in `createSession.workingDirectories`.
+The upstream proposal
+([`multiroot-sessions.md`](https://github.com/microsoft/agent-host-protocol/blob/main/docs/proposals/multiroot-sessions.md))
+frames the feature as *representation and control, not access
+enforcement*: the harness (here, opencode) decides how directory access
+is actually realized.
+
+**Current state.** The single-directory half of the surface already
+works: the host honors `createSession.workingDirectories` (first entry —
+it boots that directory's location) and publishes `workingDirectories` on
+every session ([design.md §7.3](design.md#73-workspace-workingdirectories)).
+It deliberately advertises no capability, so conformant clients never
+send the five multiroot working-directory actions (the rejected echoes in
+[§2.3](#23-client-dispatchable-actions)).
+
+**The blocker is upstream.** opencode's `Location.Ref` is a single
+`directory` (v2.2.7) — a session's agent has tool access confined to its
+one location. Until opencode gains a multiroot location model, any
+additional working directory would be **metadata-only** for the agent:
+the client could declare it and the host could bookkeep it, but the agent
+would have no tool access to it. That is the request in
+[§4.1](#41-opencode--feature-requests-to-file), item 8.
+
+**No client drives it today.** The capability gates all multiroot
+affordances, and the VS Code 1.145.2 workbench carries no reference to
+`multipleWorkingDirectories` (stable-bundle grep, 2026-11-13) — nothing
+in the field sends more than one working directory or any of the five
+actions.
+
+**What the host-side work would be**, once opencode supports multiroot:
+honor multiple `createSession` entries, handle the five actions (session-
+and chat-level set / remove / replaced), carry per-chat subsets, and
+publish merged multi-repo changesets. The last is largely representable
+today: the changeset machinery's git fallback is already repo-root-based
+and content refs are keyed by absolute path, so a changeset spanning
+several repositories is a natural shape. The rest is bookkeeping around a
+directory set the agent cannot yet act on — which is why this stays
+potential.
+
 ---
 
 ## 2. The AHP 1.0.0 surface the host does not implement
@@ -252,14 +303,15 @@ back it.
 - `workingDirectorySet` / `workingDirectoryRemoved` — multiroot working
   directories; the host advertises no `multipleWorkingDirectories`
   capability (a location is one directory), so conformant clients never
-  send them.
+  send them ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)).
 - `inputAnswerChanged` / `inputCompleted` — elicitation;
   [§1.1](#11-elicitation-completion-decision-pending).
 
 **Session** — unhandled:
 
 - `workingDirectorySet` / `workingDirectoryRemoved` /
-  `workingDirectoryReplaced` — same multiroot reason as above.
+  `workingDirectoryReplaced` — same multiroot reason as above
+  ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)).
 - `customizationToggled` — toggle a customization on/off; opencode's
   agents are static file/config definitions, and the plugin surface has
   no agent enable/disable toggle.
@@ -412,11 +464,18 @@ Ordered by impact. Findings verified against v2.2.6 source and current
 7. **File-watch subscription** (or a durable file-change event stream)
    — would back `createResourceWatch` / `ahp-resource-watch:`
    ([§2.1](#21-commands)). Long-term; no current client need.
+8. **Multiroot sessions** — a session/location model that spans several
+   checkouts; opencode's `Location.Ref` is a single `directory`
+   (v2.2.7) and the agent's tool access is confined to it. Would unlock
+   the AHP 1.0.0 `multipleWorkingDirectories` capability
+   ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)); until
+   then any additional working directory would be metadata-only to the
+   agent. No client in the field drives it today.
 
 Impact note: #1 changes the deployment UX (zero-touch boot), #2 removes
 the mandatory config entry (the idle timeout), #4 is the only path to
 remote elicitation — the three that change the shape of the product.
-#3 and #5–#7 are on-demand feature unlocks.
+#3 and #5–#8 are on-demand feature unlocks.
 
 ### 4.2 VS Code — upstream requests & watches
 

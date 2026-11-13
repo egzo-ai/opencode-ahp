@@ -180,6 +180,15 @@ export class HostRpc extends HostEvents {
       case "resourceRead":
         await this.handleResourceRead(socketId, msg);
         break;
+      case "resourceResolve":
+        await this.handleResourceResolve(socketId, msg);
+        break;
+      case "resourceList":
+        await this.handleResourceList(socketId, msg);
+        break;
+      case "resourceMkdir":
+        await this.handleResourceMkdir(socketId, msg);
+        break;
       case "invokeChangesetOperation":
         await this.handleInvokeChangesetOperation(socketId, msg);
         break;
