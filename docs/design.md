@@ -41,9 +41,21 @@ What the client gets in the Agents window:
   replay.
 - **Model picker** — the real opencode catalog (every provider/model the
   server exposes, including models from sync plugins).
-- **Agent picker** — opencode's user-invocable agents as AHP custom
-  agents under a workspace directory node; subagent-mode agents are
-  hidden, hidden agents are omitted.
+- **Agent picker and session catalog** — opencode's user-invocable
+  agents as AHP custom agents under a workspace directory node
+  (subagent-mode agents are hidden, hidden agents are omitted), plus
+  the session customization catalog ([§7.5](#75-session-customization-catalog)):
+  a sibling skills directory node, top-level MCP server entries with
+  their live status and a working enable toggle, and the session's
+  `serverTools` (opencode's tool registry minus the client-contributed
+  tools). In VS Code's
+  Customizations panel — which merges host customizations with its own
+  built-ins — the Agents / Skills / MCP Servers / Tools entries are
+  opencode's live surface; any remaining built-in entries stay
+  **display only** — they are never transmitted to the host, and the
+  session's agent has no awareness of them (the sole client → agent
+  capability channel is `activeClientSet`'s tools,
+  [§10](#10-client-provided-tools)).
 - **Chat** — streaming text + reasoning, the full tool-call lifecycle,
   permission prompts, steering/queueing, and usage totals.
 - **Client tools** — a client can register tools per session; the model
@@ -127,7 +139,7 @@ flowchart TB
 | `src/channels.ts` | Channel URI parsing/formatting (`ahp-root://`, `ahp-session:/`, `ahp-chat:/`, `ahp-terminal:/`, `…/changeset/…`, plus the non-standard legacy session form `<scheme>:/<suffix>` — `isSessionChannel`) and the `ChannelRegistry` (per-socket subscriptions, live session ids, live session-channel URIs, live terminal URIs). |
 | `src/seq.ts` | The `Sequencer`: a single **host-wide** monotonic `serverSeq` (AHP 1.0.0 numbers all channels on one sequence) with a bounded replay window. |
 | `src/state.ts` | Channel state stores. Every store simply applies the **official reducers** from `@microsoft/agent-host-protocol` (`rootReducer`, `sessionReducer`, `chatReducer`, `changesetReducer`, `terminalReducer`) — the host never hand-rolls a state transition. |
-| `src/bridge.ts` | The opencode-aware mapping layer: the `OpencodeFacade` contract, `mapV2Event` (raw v2 event → narrow `FacadeEvent` union), catalog/summary/changeset builders, and the content-ref URI helpers (`file://`, `ahp-content://head/…`, `ahp-content://snap/…`). |
+| `src/bridge.ts` | The opencode-aware mapping layer: the `OpencodeFacade` contract, `mapV2Event` (raw v2 event → narrow `FacadeEvent` union), catalog/summary/changeset builders, the session customization catalog mappers ([§7.5](#75-session-customization-catalog): the skill-directory container, MCP server state, and `serverTools`), and the content-ref URI helpers (`file://`, `ahp-content://head/…`, `ahp-content://snap/…`). |
 | `src/client-tools.ts` | Pure helpers for client-provided tools: wire validation of `ToolDefinition`s, the cross-session tool union, and per-session provider lookup. |
 | `src/options.ts` | Option validation + resolution (ctx options ▸ `options.jsonc` sibling ▸ built-ins) and a dependency-free JSONC stripper. |
 | `src/path-policy.ts` | The directory allowlist ([§3.3](#33-directory-allowlist-allowedworkingdirectories)): the pure `PathPolicy` decision (prefix/inside match over the symlink-resolved target) with the filesystem half injected, plus prefix lexical normalization. |
@@ -483,7 +495,10 @@ metadata ([§15.2](#152-session-metadata-markers)):
 A peer whose owner is not registered yet is queued; the queue drains when
 the owner registers, or — if the owner has vanished from opencode after
 the grace window — the peer falls back to standalone registration (the
-data stays reachable).
+data stays reachable). A standalone registration also picks up the
+session customization catalog ([§7.5](#75-session-customization-catalog))
+as a fire-and-forget pair of change actions after the root
+announcement — this path is synchronous and cannot await the facade.
 
 ### 7.3 Workspace (`workingDirectories`)
 
@@ -589,6 +604,159 @@ clears only the **chat**'s status. Aggregating from the chats instead
 gives the list "Working…" for the duration of any turn (including plain
 streaming turns, which are otherwise invisible at the session level) and
 idle again when the turn ends, regardless of input round trips.
+
+### 7.5 Session customization catalog
+
+The session state publishes opencode's own customization surface beyond
+the agent directory container: skills, MCP servers, and the session's
+`serverTools`. This feeds the Skills / MCP Servers / Tools entries of
+VS Code's Customizations panel, which merges the host's session
+customizations with its own built-ins ([§1](#1-purpose)). The catalog is
+a **snapshot per registration**, not a live view: the host reads the
+plugin's own location at the moment the session registers.
+
+**Snapshot points.** `createSession` awaits the facade lists before it
+builds the session store, so the catalog is part of the initial state
+and the first snapshot a subscriber receives. External registration
+([§7.2](#72-external-sessions)) is a synchronous path that cannot await
+the facade: the session registers and the root announcement go out
+first, and the catalog lands after as a fire-and-forget pair of change
+actions — `session/customizationsChanged` and `session/serverToolsChanged`
+(both full replacements) — published against the live store. A client
+that subscribes in the window holds a snapshot without the catalog and
+receives the change actions; the store converges either way, and the
+pair is skipped when the record is gone by the time the snapshot
+resolves.
+
+**The directory.** The catalog anchors on the session's working
+directory — its own `workingDirectories` directory when it has one, else
+the location directory — and every entry carries that directory's
+`file://` URI. When no directory is available at all (the options
+provide none and neither does the session), the catalog degrades to
+absent — the legacy agents-only behavior.
+
+**The containers.** A `DirectoryCustomization` holds one child type
+(`contents` is singular), so the directory appears as two sibling
+containers over the same URI:
+
+- `opencode:directory:<dir>` — `contents: agent`, the existing
+  agent-directory container ([§7.1](#71-the-mapping)), present only when
+  at least one non-hidden agent exists;
+- `opencode:directory:<dir>:skills` — `contents: skill`, the sibling
+  carrying `SkillCustomization` children: `id` = `uri` = the skill's
+  `path` (a filesystem path becomes a `file://` URI; the virtual
+  `skill://…` paths the built-in skills use pass through unchanged),
+  and `autoinvoke: false` maps to `disableModelInvocation: true` (the
+  user can select the skill; the model must not invoke it).
+
+MCP servers are **top-level** `McpServerCustomization` entries — the
+protocol's slot for a "globally-configured MCP server that isn't
+bundled in a plugin or directory": `id` = `opencode:mcp/<name>`, `uri`
+= the session's directory URI (the closest provenance the status list
+carries — the server is configured for that directory's location), and
+`name` = the configured display title when there is one, else the
+config name. A server whose status is `disabled` additionally carries
+a single Workspace `enablement` entry with `enabled: false` (file- or
+toggle-disabled — the status list does not distinguish them); an
+enabled server omits the field, since the panel's effective-enabled
+value is `enablement[0].enabled ?? true` and an absent field means
+enabled by default.
+
+**MCP state mapping.** opencode's live `Mcp.Status` maps to the AHP
+`McpServerState` as: `connected` → `ready`, `pending` → `starting`,
+`disabled` → `stopped`, `failed` → `error` (`errorType: "mcp.failed"`,
+the status's message). `needs_auth` also degrades to `error`
+(`errorType: "mcp.auth-required"`): the AHP `auth-required` state
+requires the RFC 9728 `ProtectedResourceMetadata` — an https `resource`
+URI — which opencode's status does not carry (message only), so the
+host reports an error rather than inventing a resource identifier.
+
+**Toggling.** The panel's enable toggle
+(`session/customizationToggled` on an `opencode:mcp/<name>` id) and
+the dedicated `session/mcpServerStartRequested` /
+`session/mcpServerStopRequested` control actions are honored for MCP
+servers, and all three map to one mechanism: opencode's `disabled`
+config flag. The plugin layers its decisions over the file config
+through a single `ctx.mcp.transform` registration — the same
+rebuild-then-reload pattern as the client tools
+([§10.1](#101-registration-into-opencode)) — and then `ctx.mcp.reload()`,
+which awaits the full MCP re-reconcile: a disable disposes the
+connection and settles status `disabled`; a re-enable starts the
+connection and resolves only once its new status has settled. The host
+then echoes the action and re-snapshots the catalog, re-pushing it
+(full replacements) to **every** live session — the toggled server's
+tools leave the registry, so its `serverTools` entry goes too, and
+each session's entry converges on the new `state` and `enablement`.
+Decisions are **location-runtime only**: the config file is never
+written and a restart or location reload drops them. The decisions are
+a name → flag map rather than a set, so a file-`disabled` server can
+be explicitly re-enabled at runtime (and a runtime disable overrides
+a file enable). `session/mcpServerBackgroundRequested` stays rejected
+— there is no blocking-start concept on the plugin side — and every
+non-MCP customization (agents, skills, directories) is rejected with
+a static-definition reason: they are file/config definitions opencode
+cannot disable, so the write-ahead client rolls the toggle back.
+
+**`serverTools`.** The session's `serverTools` is the opencode tool
+registry (`ctx.tool.list()` — built-in, MCP-contributed, and
+plugin-registered tools, keyed by effective name) mapped to AHP
+`ToolDefinition`s, minus the client-contributed tool names. Client
+tools register into the same location-global opencode tool registry
+([§10](#10-client-provided-tools)), so they would otherwise echo back
+as server tools; the exclusion set is the cross-session union of every
+live session's active-client tools, and `createSession` additionally
+seeds it with the creating session's own `activeClient` tools — its
+record does not exist while the snapshot runs, so the union does not
+carry them yet.
+
+The `inputSchema` is shape-detected, with no schema-compiler dependency
+(the bridge stays pure): a plain JSON-Schema object literal (`type:
+"object"` with shape-valid `properties` / `required`) keeps those
+fields, a Standard Schema v1 instance (branded symbol) or other opaque
+object (an Effect codec) degrades to `{ type: "object" }` — the input
+is always an object, but no JSON-Schema shape is extractable — and a
+tool with no input omits the field.
+
+**Not live (except the toggle).** The catalog is not re-pushed in
+response to **opencode-side** changes during a session's lifetime.
+opencode's MCP change events (`mcp.status.changed`,
+`mcp.tools.changed`, `mcp.resources.changed`) carry only the server
+name — no state payload — so a change event alone cannot update the
+panel; acting on one would require re-snapshotting the list on every
+event (and `mcp.tools.changed` is not on the public event stream a
+plugin can observe, futures.md §1.6). The one live update is the MCP
+toggle itself (**Toggling** above): the host re-pushes
+deterministically after the re-reconcile it awaited in dispatch, not
+from a change event. A mid-session change to the client-tool union is
+likewise not re-pushed — v1 takes the per-registration snapshot for
+both. The staleness is display-only — the session's behavior does not
+depend on the snapshot — and the event-driven live re-push is the
+residual (futures.md §1.6).
+
+**Degradation.** Every list is an independent R2 seam: a facade failure
+logs and degrades that one list to empty — the session is created or
+registered either way — and the fire-and-forget pair is guarded the
+same: an externally-registered session whose catalog snapshot fails
+stays usable, just without its customization surface.
+
+**Location scoping.** The facade lists read the host's own location, so
+a cross-location session (created with `workingDirectories`, or created
+elsewhere in another location) shows the host location's catalog — the
+same provenance caveat as the agents. Live-verified against the test
+server (2026-11-13, `scripts/ahp-customizations.mjs`): the agent and
+skill containers match the server's own `/api/agent` / `/api/skill`
+(including the virtual-`skill://` built-ins), a connected MCP server
+renders `ready` under its display title, `serverTools` is non-empty and
+shaped (MCP-contributed tools included, no client-tool echo), and an
+externally-created session converges on the catalog through the
+change-action pair. The MCP toggle was live-verified on 2026-11-14
+with the same script: disabling a connected server via
+`session/customizationToggled` (accepted; the re-pushed entry is
+`stopped` with the workspace disable `enablement`; `/api/mcp` reports
+`disabled`), toggling the agent directory rejected with the
+static-definition reason, and re-enabling via
+`session/mcpServerStartRequested` (the entry `ready` again, `/api/mcp`
+`connected`).
 
 ## 8. Turn lifecycle (event pump)
 
@@ -736,6 +904,8 @@ identifies a single chat once multi-chat is on).
 | `session/activeClientRemoved` | Same clientId check; echo + tool-union re-sync. |
 | `changeset/filesReviewChanged` | The only client-dispatchable changeset action: validates the channel resolves to a live changeset, echoes (the reducer toggles `reviewed` per file). |
 | `chat/draftChanged`, `chat/isReadChanged`, `chat/isArchivedChanged`, `session/isReadChanged`, `session/isArchivedChanged` | Echo-only (the state is client-side UI bookkeeping). |
+| `session/customizationToggled` | Honored for the host's `opencode:mcp/<name>` ids — the effective decision is `enablement[0].enabled ?? true`, and the toggle maps to opencode's `disabled` flag plus the awaited MCP re-reconcile ([§7.5](#75-session-customization-catalog)): accepted echo, then the catalog is re-snapshotted and re-pushed to every live session. A facade failure rejects with "mcp toggle failed: …". Every other customization is rejected: "cannot toggle: only MCP servers are togglable on this host — agents and skills are static file/config definitions". |
+| `session/mcpServerStartRequested`, `session/mcpServerStopRequested` | The same path as the toggle (start = enable, stop = disable) for MCP ids; non-MCP ids rejected ("cannot start or stop: only MCP servers accept start/stop on this host"). `session/mcpServerBackgroundRequested` is not in the dispatch table and falls to the default "unsupported action" rejection (no blocking-start concept on the plugin side). |
 | `terminal/input`, `terminal/resized`, `terminal/claimed`, `terminal/titleChanged`, `terminal/cleared` | On a **pty** terminal: input/resize drive the process, claim/title/clear apply through the official reducer (rejections for the invalid shapes and the non-holder claim — [§12.2](#122-pty-terminals-interactive-shells)). On a **synthetic** terminal: every one is rejected ("read-only terminal …"). |
 | any other client-dispatchable action | Echoed with a `rejectionReason` ("unsupported action …"). |
 
@@ -750,7 +920,14 @@ normalization.
 
 Clients register tools per session via `createSession.activeClient` or
 `session/activeClientSet` (an `activeClient` is `{ clientId, tools,
-displayName? }`). Active clients are **session-level** state; tool
+displayName? }`). AHP 1.0.0's `SessionActiveClient` also carries a
+`customizations` field (client-published plugins — the protocol's door
+for client-side MCP servers / skills to reach a session), but the host
+**drops it** in normalization: only `tools` cross the wire, so a
+client's customization surface never appears in the session state. The
+client's built-in display section (the panel's Built-in list) is part
+of no AHP message at all — it belongs to the client's own agent
+harness. Active clients are **session-level** state; tool
 *invocations* are **chat-level** (each chat has its own backend session).
 
 ### 10.1 Registration into opencode

@@ -85,6 +85,25 @@ export class HostClientTools extends HostTurns {
   }
 
   /**
+   * The cross-session union of every live session's active-client
+   * tool names — the names the location-global opencode registry
+   * currently carries because of AHP clients (see
+   * {@link syncClientToolsToOpencode}). Used to keep those names out
+   * of a session's `serverTools` snapshot: a client tool already
+   * reaches the model through the client and must not echo back as a
+   * server tool.
+   */
+  protected clientToolNames(): ReadonlySet<string> {
+    const names = new Set<string>();
+    for (const rec of this.sessions.values()) {
+      for (const client of rec.sessionStore.state.activeClients) {
+        for (const tool of client.tools) names.add(tool.name);
+      }
+    }
+    return names;
+  }
+
+  /**
    * Re-sync the location-global opencode tool registry with the
    * cross-session union of every live session's active-client tools
    * (first-registered wins per name). Location-global by design —

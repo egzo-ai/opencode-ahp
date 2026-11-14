@@ -7,10 +7,11 @@
  * external registration/removal, the createSession race remap).
  */
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   CustomizationType,
+  McpServerStatus,
   SessionStatus,
   ToolCallStatus,
   TurnState,
@@ -19,6 +20,7 @@ import {
   type ChatState,
   type DirectoryCustomization,
   type SessionState,
+  type SkillCustomization,
 } from "@microsoft/agent-host-protocol";
 import {
   DISCARD_OPERATION_ID,
@@ -32,9 +34,12 @@ import {
   type FacadeDirectoryEntry,
   type FacadeDiffFile,
   type FacadeEvent,
+  type FacadeMcpServer,
   type FacadeProvider,
   type FacadeResourceInfo,
   type FacadeSession,
+  type FacadeSkill,
+  type FacadeTool,
   type OpencodeFacade,
 } from "../bridge.js";
 import {
@@ -133,6 +138,17 @@ interface Frame {
 class FakeFacade implements OpencodeFacade {
   providers: FacadeProvider[] = [provider];
   agentList: FacadeAgent[] = agents;
+  // ── session customization catalog ──────────────────
+  /** Default empty: existing snapshot assertions stay valid; tests opt in. */
+  mcpServers: FacadeMcpServer[] = [];
+  skills: FacadeSkill[] = [];
+  tools: FacadeTool[] = [];
+  /**
+   * When > 0 the catalog lists resolve after this delay — widens the
+   * external-registration window (announcement before the catalog
+   * change actions) so a test can subscribe in between.
+   */
+  catalogDelayMs = 0;
   sessions = new Map<string, FacadeSession>();
   promptCalls: { sessionID: string; text: string; delivery?: "steer" | "queue" }[] = [];
   switchModelCalls: { sessionID: string; model: { providerID: string; modelID: string; variant?: string } }[] = [];
@@ -182,6 +198,11 @@ class FakeFacade implements OpencodeFacade {
   // ── client tools ──────────────────────────────────
   /** Every `syncClientTools` call (the cross-session union each time). */
   syncClientToolsCalls: FacadeClientTool[][] = [];
+  // ── MCP toggle ────────────────────────────────────
+  /** Every `setMcpDisabled` call, in order. */
+  setMcpDisabledCalls: { name: string; disabled: boolean }[] = [];
+  /** When set, `setMcpDisabled` throws (the dispatch rejects the toggle). */
+  mcpDisabledError: string | null = null;
 
   private queue: FacadeEvent[] = [];
   private waiters: Array<() => void> = [];
@@ -211,6 +232,21 @@ class FakeFacade implements OpencodeFacade {
   }
   async listAgents(): Promise<readonly FacadeAgent[]> {
     return this.agentList;
+  }
+  private async catalogDelay(): Promise<void> {
+    if (this.catalogDelayMs > 0) await new Promise((r) => setTimeout(r, this.catalogDelayMs));
+  }
+  async listMcpServers(): Promise<readonly FacadeMcpServer[]> {
+    await this.catalogDelay();
+    return this.mcpServers;
+  }
+  async listSkills(): Promise<readonly FacadeSkill[]> {
+    await this.catalogDelay();
+    return this.skills;
+  }
+  async listTools(): Promise<readonly FacadeTool[]> {
+    await this.catalogDelay();
+    return this.tools;
   }
   async createSession(input?: {
     id?: string;
@@ -423,6 +459,21 @@ class FakeFacade implements OpencodeFacade {
   }
   async syncClientTools(tools: readonly FacadeClientTool[]): Promise<void> {
     this.syncClientToolsCalls.push([...tools]);
+  }
+  async setMcpDisabled(name: string, disabled: boolean): Promise<void> {
+    if (this.mcpDisabledError !== null) throw new Error(this.mcpDisabledError);
+    this.setMcpDisabledCalls.push({ name, disabled });
+    // Mirror the re-reconcile: the status follows the flag (a re-enabled
+    // server comes back `connected`; other statuses are left alone).
+    for (const server of this.mcpServers) {
+      if (server.name !== name) continue;
+      if (disabled) {
+        server.status = "disabled";
+        delete server.error;
+      } else if (server.status === "disabled") {
+        server.status = "connected";
+      }
+    }
   }
 }
 
@@ -801,6 +852,83 @@ describe("createSession", () => {
       expect(res.error?.code).toBe(ERROR_INVALID_PARAMS);
     }
     expect(h.facade.createCalls).toHaveLength(0);
+    h.stop();
+  });
+
+  it("seeds the snapshot with the customization catalog and server tools (client tools excluded)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.skills = [
+      { id: "opencode", name: "OpenCode", path: "skill://opencode/SKILL.md" },
+      { id: "demo", name: "Demo", description: "A demo skill", autoinvoke: false, path: "/home/u/.config/opencode/skills/demo/SKILL.md" },
+    ];
+    h.facade.mcpServers = [
+      { name: "context7", title: "Context7", status: "connected" },
+      { name: "broken", status: "failed", error: "boom" },
+    ];
+    h.facade.tools = [
+      { name: "bash", description: "Run a shell command", input: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+      { name: "ct_a" },
+    ];
+
+    // Session A's own `activeClient` provides `ct_a`: the record does not
+    // exist while the snapshot runs, so its exclusion is pre-seeded.
+    await createSession(
+      h,
+      1,
+      sessionChannelURI("ses_cat_a"),
+      { provider: "gpuz", activeClient: { clientId: "c1", tools: [{ name: "ct_a" }] } },
+      100,
+    );
+    const sessA = await sessionSnapshotState(h, 1, sessionChannelURI("ses_cat_a"), 101);
+    // Session B (no active client): `ct_a` is excluded through the
+    // cross-session union (A's active client).
+    await createSession(h, 1, sessionChannelURI("ses_cat_b"), { provider: "gpuz" }, 102);
+    const sessB = await sessionSnapshotState(h, 1, sessionChannelURI("ses_cat_b"), 103);
+
+    for (const sess of [sessA, sessB]) {
+      // The agent directory container (the existing dropdown-fix invariant).
+      const { container, children } = agentDirectoryOf(sess);
+      expect(container.id).toBe(`opencode:directory:${DIR}`);
+      expect(children.map((c) => c.name)).toEqual(["Build", "Plan", "Explore"]);
+      // The skills directory container: a sibling over the same URI, with
+      // the virtual built-in path and the on-disk skill.
+      const skillDir = sess.customizations!.find(
+        (c) => c.type === CustomizationType.Directory && c.id === `opencode:directory:${DIR}:skills`,
+      ) as DirectoryCustomization;
+      expect(skillDir.contents).toBe("skill");
+      expect(skillDir.uri).toBe(container.uri);
+      const skillChildren = (skillDir.children ?? []) as SkillCustomization[];
+      expect(skillChildren.map((c) => c.name)).toEqual(["OpenCode", "Demo"]);
+      expect(skillChildren.find((c) => c.name === "Demo")!.disableModelInvocation).toBe(true);
+      // Top-level MCP entries: the connected server is ready (title over
+      // name); the failed server carries its error.
+      expect(sess.customizations!.find((c) => c.id === "opencode:mcp/context7")).toEqual({
+        type: CustomizationType.McpServer,
+        id: "opencode:mcp/context7",
+        uri: container.uri,
+        name: "Context7",
+        state: { kind: McpServerStatus.Ready },
+      });
+      expect(sess.customizations!.find((c) => c.id === "opencode:mcp/broken")).toEqual({
+        type: CustomizationType.McpServer,
+        id: "opencode:mcp/broken",
+        uri: container.uri,
+        name: "broken",
+        state: { kind: McpServerStatus.Error, error: { errorType: "mcp.failed", message: "boom" } },
+      });
+      // Server tools: the registry's `bash` with its JSON-Schema input —
+      // and `ct_a` is NOT echoed back (it reaches the model through the
+      // client).
+      expect(sess.serverTools).toEqual([
+        {
+          name: "bash",
+          description: "Run a shell command",
+          inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+        },
+      ]);
+    }
     h.stop();
   });
 });
@@ -1588,6 +1716,206 @@ describe("session-level actions", () => {
   });
 });
 
+// ── MCP toggle ────────────────────────────────────────────────────────────
+// The panel's enable toggle (`session/customizationToggled` on an
+// `opencode:mcp/<name>` id) and the dedicated start/stop control actions
+// map to the facade's `setMcpDisabled` (opencode's `disabled` flag + MCP
+// re-reconcile). The accepted echo is followed by a full catalog re-push
+// so the entry's `state` and the `enablement` the panel reads converge.
+
+describe("MCP toggle", () => {
+  const SES = "ses_mcp_toggle";
+  const mcpEntry = (customizations: any[], name: string) =>
+    customizations.find((c: any) => c.id === `opencode:mcp/${name}`);
+
+  it("session/customizationToggled disables a configured MCP server", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.mcpServers = [{ name: "context7", title: "Context7", status: "connected" }];
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 140);
+
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 1,
+      action: {
+        type: "session/customizationToggled",
+        id: "opencode:mcp/context7",
+        enablement: [{ kind: "session", enabled: false }],
+      },
+    });
+    await waitFor(() => h.facade.setMcpDisabledCalls.length === 1, "setMcpDisabled");
+    expect(h.facade.setMcpDisabledCalls[0]).toEqual({ name: "context7", disabled: true });
+    const echo = await waitForAction(h, sessURI, "session/customizationToggled");
+    expect(echo.rejectionReason).toBeUndefined();
+
+    // The per-location catalog re-pushes: the entry is stopped and carries
+    // the host's workspace disable decision (the panel's effective-enabled
+    // value); without it the toggle would render on while stopped.
+    const changed = await waitForAction(h, sessURI, "session/customizationsChanged");
+    const entry = mcpEntry(changed.action.customizations, "context7");
+    expect(entry.state).toEqual({ kind: McpServerStatus.Stopped });
+    expect(entry.enablement).toEqual([{ kind: "workspace", uri: pathToFileURL(DIR).href, enabled: false }]);
+
+    const sess = await sessionSnapshotState(h, 1, sessURI, 150);
+    const stored = mcpEntry(sess.customizations!, "context7");
+    expect(stored.state).toEqual({ kind: McpServerStatus.Stopped });
+    expect(stored.enablement).toEqual(entry.enablement);
+    h.stop();
+  });
+
+  it("session/customizationToggled re-enables (absent decision → enabled, no enablement)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // File-disabled (or previously toggled off): stopped with no tools.
+    h.facade.mcpServers = [{ name: "context7", status: "disabled" }];
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 141);
+    const seeded = await sessionSnapshotState(h, 1, sessURI, 142);
+    expect(mcpEntry(seeded.customizations!, "context7").state).toEqual({ kind: McpServerStatus.Stopped });
+    expect(mcpEntry(seeded.customizations!, "context7").enablement).toHaveLength(1);
+
+    // The client strips the decision when turning the server back on
+    // (empty enablement array = no explicit decision = enabled).
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 1,
+      action: { type: "session/customizationToggled", id: "opencode:mcp/context7", enablement: [] },
+    });
+    await waitFor(() => h.facade.setMcpDisabledCalls.length === 1, "setMcpDisabled");
+    expect(h.facade.setMcpDisabledCalls[0]).toEqual({ name: "context7", disabled: false });
+    const echo = await waitForAction(h, sessURI, "session/customizationToggled");
+    expect(echo.rejectionReason).toBeUndefined();
+    const changed = await waitForAction(h, sessURI, "session/customizationsChanged");
+    const entry = mcpEntry(changed.action.customizations, "context7");
+    expect(entry.state).toEqual({ kind: McpServerStatus.Ready });
+    expect(entry.enablement).toBeUndefined();
+    h.stop();
+  });
+
+  it("mcpServerStopRequested / mcpServerStartRequested drive the same path", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.mcpServers = [{ name: "context7", title: "Context7", status: "connected" }];
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 143);
+
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 1,
+      action: { type: "session/mcpServerStopRequested", id: "opencode:mcp/context7" },
+    });
+    await waitFor(() => h.facade.setMcpDisabledCalls.length === 1, "setMcpDisabled");
+    expect(h.facade.setMcpDisabledCalls[0]).toEqual({ name: "context7", disabled: true });
+    const stop = await waitForAction(h, sessURI, "session/mcpServerStopRequested");
+    expect(stop.rejectionReason).toBeUndefined();
+
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 2,
+      action: { type: "session/mcpServerStartRequested", id: "opencode:mcp/context7" },
+    });
+    await waitFor(() => h.facade.setMcpDisabledCalls.length === 2, "setMcpDisabled");
+    expect(h.facade.setMcpDisabledCalls[1]).toEqual({ name: "context7", disabled: false });
+    const start = await waitForAction(h, sessURI, "session/mcpServerStartRequested");
+    expect(start.rejectionReason).toBeUndefined();
+
+    // Both re-pushes landed; the final state is the re-enabled one.
+    const sess = await sessionSnapshotState(h, 1, sessURI, 153);
+    expect(mcpEntry(sess.customizations!, "context7").state).toEqual({ kind: McpServerStatus.Ready });
+    h.stop();
+  });
+
+  it("rejects toggles and start/stop for non-MCP customizations", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.mcpServers = [{ name: "context7", status: "connected" }];
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 144);
+
+    // The agent directory container (and its agent children) are static
+    // file/config definitions — no enable/disable mechanism exists.
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 1,
+      action: {
+        type: "session/customizationToggled",
+        id: `opencode:directory:${DIR}`,
+        enablement: [{ kind: "session", enabled: false }],
+      },
+    });
+    const toggle = await waitForAction(h, sessURI, "session/customizationToggled", (a) => a.rejectionReason !== undefined);
+    expect(toggle.rejectionReason).toMatch(/static file\/config definitions/);
+
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 2,
+      action: { type: "session/mcpServerStopRequested", id: `opencode:directory:${DIR}` },
+    });
+    const stop = await waitForAction(h, sessURI, "session/mcpServerStopRequested", (a) => a.rejectionReason !== undefined);
+    expect(stop.rejectionReason).toMatch(/only MCP servers accept start\/stop/);
+    expect(h.facade.setMcpDisabledCalls).toHaveLength(0);
+    h.stop();
+  });
+
+  it("rejects the toggle with a reason when the facade fails", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.mcpServers = [{ name: "context7", status: "connected" }];
+    h.facade.mcpDisabledError = "reconcile blew up";
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 145);
+    h.send(1, "dispatchAction", {
+      channel: sessURI,
+      clientSeq: 1,
+      action: { type: "session/mcpServerStopRequested", id: "opencode:mcp/context7" },
+    });
+    const rejected = await waitForAction(h, sessURI, "session/mcpServerStopRequested", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/mcp toggle failed: reconcile blew up/);
+    h.stop();
+  });
+
+  it("re-pushes the catalog to every live session (shared per-location state)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.mcpServers = [{ name: "context7", status: "connected" }];
+    await createSession(h, 1, sessionChannelURI("ses_mcp_a"), { provider: "gpuz" });
+    await createSession(h, 1, sessionChannelURI("ses_mcp_b"), { provider: "gpuz" });
+    const [uriA, uriB] = [sessionChannelURI("ses_mcp_a"), sessionChannelURI("ses_mcp_b")];
+    await subscribe(h, 1, uriA, 146);
+    await subscribe(h, 1, uriB, 147);
+
+    h.send(1, "dispatchAction", {
+      channel: uriA,
+      clientSeq: 1,
+      action: {
+        type: "session/customizationToggled",
+        id: "opencode:mcp/context7",
+        enablement: [{ kind: "session", enabled: false }],
+      },
+    });
+    const changedA = await waitForAction(h, uriA, "session/customizationsChanged");
+    const changedB = await waitForAction(h, uriB, "session/customizationsChanged");
+    for (const changed of [changedA, changedB]) {
+      const entry = mcpEntry(changed.action.customizations, "context7");
+      expect(entry.state).toEqual({ kind: McpServerStatus.Stopped });
+      expect(entry.enablement).toEqual([{ kind: "workspace", uri: pathToFileURL(DIR).href, enabled: false }]);
+    }
+    h.stop();
+  });
+});
+
 // ── external sessions (event pump registration) ───────────────────────────
 
 describe("external sessions", () => {
@@ -1695,6 +2023,50 @@ describe("external sessions", () => {
     const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_foreign"), 163);
     expect(sess.title).toBe("Foreign session");
     expect(sess.workingDirectories).toEqual([directoryUri(OTHER)]);
+    h.stop();
+  }, 10000);
+
+  it("an externally-registered session converges on the catalog via change actions", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.skills = [{ id: "opencode", name: "OpenCode", path: "skill://opencode/SKILL.md" }];
+    h.facade.tools = [{ name: "bash", description: "Run a shell command" }];
+    // Widen the window: the announcement lands first, the catalog
+    // change actions follow (the synchronous path cannot await).
+    h.facade.catalogDelayMs = 50;
+    const t0 = Date.now() - 5000;
+    h.facade.sessions.set("ses_tui_cat", {
+      sessionID: "ses_tui_cat",
+      title: "TUI session",
+      time: { created: t0, updated: t0 },
+    });
+    h.facade.push({ type: "session.created", sessionID: "ses_tui_cat", title: "TUI session" });
+
+    await waitFor(
+      () => h.notification("root/sessionAdded", 1) !== undefined,
+      "root/sessionAdded for the external session",
+      3000,
+    );
+    // Subscribe in the window: the snapshot does not carry the catalog
+    // yet — the change actions follow.
+    const ch = sessionChannelURI("ses_tui_cat");
+    const early = await subscribe(h, 1, ch, 200);
+    expect(early.result?.snapshot?.state?.customizations).toBeUndefined();
+    expect(early.result?.snapshot?.state?.serverTools).toBeUndefined();
+
+    const customizationsChanged = await waitForAction(h, ch, "session/customizationsChanged");
+    const skillDir = (customizationsChanged.action.customizations as Record<string, any>[]).find(
+      (c) => c.id === `opencode:directory:${DIR}:skills`,
+    );
+    expect(((skillDir?.children ?? []) as { name: string }[]).map((c) => c.name)).toEqual(["OpenCode"]);
+    const serverToolsChanged = await waitForAction(h, ch, "session/serverToolsChanged");
+    expect(serverToolsChanged.action.tools).toEqual([{ name: "bash", description: "Run a shell command" }]);
+
+    // The store has converged: a fresh subscribe carries the catalog.
+    const sess = await sessionSnapshotState(h, 1, ch, 201);
+    expect(sess.customizations!.some((c) => c.id === `opencode:directory:${DIR}:skills`)).toBe(true);
+    expect(sess.serverTools).toEqual([{ name: "bash", description: "Run a shell command" }]);
     h.stop();
   }, 10000);
 });
@@ -2759,9 +3131,11 @@ describe("client tools", () => {
     const h = makeHarness();
     h.init(1, "c1");
     await waitInit(h, 1);
-    await createSession(h, 1, SC, { provider: "gpuz" });
+    await createSession(h, 1, SC, { provider: "gpuz" }, 100);
     const SES2 = "ses_ct2";
-    await createSession(h, 1, sessionChannelURI(SES2), { provider: "gpuz" });
+    // Distinct RPC ids: the second await must match its own response,
+    // not the first session's (both are `result: null`).
+    await createSession(h, 1, sessionChannelURI(SES2), { provider: "gpuz" }, 101);
     h.send(1, "dispatchAction", {
       channel: SC,
       clientSeq: 1,

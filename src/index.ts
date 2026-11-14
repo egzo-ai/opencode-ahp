@@ -72,10 +72,13 @@ import {
   type FacadeClientTool,
   type FacadeDirectoryEntry,
   type FacadeDiffFile,
+  type FacadeMcpServer,
   type FacadeModel,
   type FacadeModelRef,
   type FacadeResourceInfo,
   type FacadeSession,
+  type FacadeSkill,
+  type FacadeTool,
   type OpencodeFacade,
 } from "./bridge.js";
 import { normalizedName } from "./client-tools.js";
@@ -546,6 +549,14 @@ function implementFacade(
   let clientTools: FacadeClientTool[] = [];
   let clientToolsTransformRegistered = false;
 
+  // The MCP toggle decisions (server name → desired `disabled`), layered
+  // over the config-file servers by a single `ctx.mcp.transform`
+  // registration (same rebuild-then-reload pattern as the client tools).
+  // Runtime-only: the config file is untouched and the map is empty on
+  // a fresh location, so a restart drops the decisions.
+  const mcpDisabled = new Map<string, boolean>();
+  let mcpDisabledTransformRegistered = false;
+
   const readTextFile = async (absPath: string): Promise<string | null> => {
     try {
       return await fsReadFile(absPath, "utf-8");
@@ -605,6 +616,60 @@ function implementFacade(
         mode: a.mode,
         hidden: a.hidden,
       }));
+    },
+    // ── session customization catalog ───────────────────────────
+    async listMcpServers(): Promise<readonly FacadeMcpServer[]> {
+      const { data: servers } = await ctx.mcp.list();
+      return servers.map((s) => ({
+        name: String(s.name),
+        ...(s.title !== undefined ? { title: String(s.title) } : {}),
+        status: s.status.status,
+        ...("error" in s.status ? { error: s.status.error } : {}),
+      }));
+    },
+    async listSkills(): Promise<readonly FacadeSkill[]> {
+      const { data: skills } = await ctx.skill.list();
+      return skills.map((s) => ({
+        id: String(s.id),
+        name: String(s.name),
+        ...(s.description !== undefined ? { description: s.description } : {}),
+        ...(s.autoinvoke !== undefined ? { autoinvoke: s.autoinvoke } : {}),
+        path: String(s.path),
+      }));
+    },
+    async listTools(): Promise<readonly FacadeTool[]> {
+      const tools = await ctx.tool.list();
+      return tools.map((t) => ({
+        name: t.name,
+        // `description` is required by the type; guard anyway (the
+        // mapper omits empty ones).
+        ...(typeof t.description === "string" ? { description: t.description } : {}),
+        input: t.input,
+      }));
+    },
+    async setMcpDisabled(name: string, disabled: boolean): Promise<void> {
+      mcpDisabled.set(name, disabled);
+      if (!mcpDisabledTransformRegistered) {
+        mcpDisabledTransformRegistered = true;
+        // Registered once for the location lifetime (scoped: disposed on
+        // location teardown). The callback is synchronous and reads the
+        // closure map at rebuild time; each rebuild is a fresh config
+        // set, so (re-)applying the current decisions is the whole sync.
+        // It runs after the config plugin's own transform (registration
+        // order), so the override lands on the file's server config.
+        await ctx.mcp.transform((editor) => {
+          for (const [server, want] of mcpDisabled) {
+            editor.update(server, (config) => {
+              config.disabled = want;
+            });
+          }
+        });
+      }
+      // The reload awaits the full MCP re-reconcile: a disable detaches
+      // the connection and settles status `disabled`; a re-enable starts
+      // the connection and resolves only once it has settled
+      // (connected / needs_auth / failed).
+      await ctx.mcp.reload();
     },
     // ── sessions ────────────────────────────────────────────────
     async createSession(input?: {

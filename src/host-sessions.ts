@@ -5,8 +5,32 @@
 import { HostChats } from "./host-chats.js";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ActionType, SessionStatus, ResolveSessionConfigResult, SessionActiveClient, SessionSummary } from "@microsoft/agent-host-protocol";
-import { agentDirectoryCustomization, chatChangesetCatalog, chatSummaryOf, directoryUri, initialSessionState, mapAgentCustomizations, sessionChangesetCatalog, FacadeSession } from "./bridge.js";
+import {
+  ActionType,
+  SessionStatus,
+  ResolveSessionConfigResult,
+  SessionActiveClient,
+  SessionSummary,
+  type Customization,
+  type ToolDefinition,
+} from "@microsoft/agent-host-protocol";
+import {
+  agentDirectoryCustomization,
+  chatChangesetCatalog,
+  chatSummaryOf,
+  directoryUri,
+  initialSessionState,
+  mapAgentCustomizations,
+  mapMcpServerCustomizations,
+  mapServerTools,
+  sessionChangesetCatalog,
+  skillDirectoryCustomization,
+  FacadeAgent,
+  FacadeMcpServer,
+  FacadeSession,
+  FacadeSkill,
+  FacadeTool,
+} from "./bridge.js";
 import { ROOT_CHANNEL, chatChannelURI, isSessionChannel, sessionChannelURI, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
@@ -236,14 +260,21 @@ export class HostSessions extends HostChats {
       this.removeRecord(interim);
     }
 
-    const agents = await this.opts.facade.listAgents();
-    // The directory customization advertises the session's own working
-    // directory — the location directory for a session without one.
-    const agentDir = sessionDir ?? this.opts.defaultDirectory;
-    const customizations =
-      mapAgentCustomizations(agents).length > 0 && agentDir !== undefined
-        ? [agentDirectoryCustomization(agentDir, agents)]
-        : undefined;
+    // The session customization catalog snapshot (design §7.5): the
+    // session's own working directory — the location directory for a
+    // session without one. Absent (the options never provide one)
+    // degrades to no catalog, mirroring the legacy agents-only
+    // behavior. The session's own `activeClient` tools are excluded
+    // too — the record is not registered yet, so the cross-session
+    // union does not carry them.
+    const catalogDir = sessionDir ?? this.opts.defaultDirectory;
+    const ownClientTools = new Set(
+      activeClients.flatMap((client) => client.tools.map((tool) => tool.name)),
+    );
+    const catalog =
+      catalogDir !== undefined
+        ? await this.sessionCatalog(catalogDir, ownClientTools)
+        : { customizations: [], serverTools: [] as ToolDefinition[] };
     const now = new Date().toISOString();
     const sessionStore = createSessionStateStore(
       initialSessionState({
@@ -251,7 +282,8 @@ export class HostSessions extends HostChats {
         provider: created.model?.providerID ?? provider?.providerID ?? "opencode",
         title: created.title ?? "New Session",
         activeClients,
-        customizations,
+        customizations: catalog.customizations,
+        serverTools: catalog.serverTools,
         workingDirectories: sessionDir !== undefined ? [directoryUri(sessionDir)] : this.workingDirectories(),
       }),
     );
@@ -416,6 +448,64 @@ export class HostSessions extends HostChats {
     }
     if (fs === null || this.sessions.has(fs.sessionID) || this.byOpencode.has(fs.sessionID)) return;
     this.registerExternal(fs);
+  }
+
+  /**
+   * The session customization catalog snapshot (design §7.5): the
+   * location's agents (their directory container), skills (the
+   * sibling directory container), MCP servers (top-level entries),
+   * and the server tools (opencode's registry minus the names the
+   * cross-session active-client union contributes). Every list is an
+   * independent R2 seam — a failure logs and degrades to empty, the
+   * session is created or registered either way.
+   *
+   * Location-scoped: the facade lists read the host's own location,
+   * so a cross-location session shows the host location's catalog
+   * (the same provenance caveat as the agents).
+   *
+   * `extraExcluded` seeds the server-tools exclusion set with names
+   * that are client-contributed but not in the cross-session union
+   * yet — the session's own `createSession.activeClient` tools, whose
+   * record does not exist while the snapshot runs.
+   */
+  private async sessionCatalog(directory: string, extraExcluded?: ReadonlySet<string>): Promise<{
+    customizations: Customization[];
+    serverTools: ToolDefinition[];
+  }> {
+    const [agents, skills, mcpServers, tools] = await Promise.all([
+      this.opts.facade.listAgents().catch((err): FacadeAgent[] => {
+        this.log(`catalog listAgents failed: ${errorMessage(err)}`);
+        return [];
+      }),
+      this.opts.facade.listSkills().catch((err): FacadeSkill[] => {
+        this.log(`catalog listSkills failed: ${errorMessage(err)}`);
+        return [];
+      }),
+      this.opts.facade.listMcpServers().catch((err): FacadeMcpServer[] => {
+        this.log(`catalog listMcpServers failed: ${errorMessage(err)}`);
+        return [];
+      }),
+      this.opts.facade.listTools().catch((err): FacadeTool[] => {
+        this.log(`catalog listTools failed: ${errorMessage(err)}`);
+        return [];
+      }),
+    ]);
+    const customizations: Customization[] = [];
+    if (mapAgentCustomizations(agents).length > 0) {
+      customizations.push(agentDirectoryCustomization(directory, agents));
+    }
+    if (skills.length > 0) {
+      customizations.push(skillDirectoryCustomization(directory, skills));
+    }
+    customizations.push(...mapMcpServerCustomizations(mcpServers, directory));
+    const excluded = new Set(this.clientToolNames());
+    if (extraExcluded !== undefined) {
+      for (const name of extraExcluded) excluded.add(name);
+    }
+    return {
+      customizations,
+      serverTools: mapServerTools(tools, excluded),
+    };
   }
 
   /**
@@ -647,7 +737,60 @@ export class HostSessions extends HostChats {
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
     });
     this.notifyRoot("root/sessionAdded", { channel: ROOT_CHANNEL, summary: this.sessionSummary(rec) });
+    // The catalog snapshot cannot await the facade in this synchronous
+    // path — it lands as a fire-and-forget change-action pair after the
+    // announcement (design §7.5).
+    void this.syncExternalCatalog(rec);
     return rec;
+  }
+
+  /**
+   * Fire-and-forget catalog application for an externally-registered
+   * session (design §7.5): snapshot the catalog, then apply
+   * `session/customizationsChanged` and `session/serverToolsChanged`
+   * (both full-replacement) to the LIVE store through `publish` —
+   * a client that subscribed in the meantime holds a snapshot without
+   * the catalog and receives the change actions; the store converges
+   * either way. Skipped when the record is already gone (removed
+   * mid-flight) and R2-guarded — the session stays usable, just
+   * without its customization surface.
+   */
+  private async syncExternalCatalog(rec: SessionRecord): Promise<void> {
+    try {
+      const directory = rec.directory ?? this.opts.defaultDirectory;
+      if (directory === undefined) return;
+      const catalog = await this.sessionCatalog(directory);
+      if (this.sessions.get(rec.sessionID) !== rec) return; // removed mid-flight
+      if (catalog.customizations.length > 0) {
+        this.publish({
+          channel: rec.channel,
+          action: { type: ActionType.SessionCustomizationsChanged, customizations: catalog.customizations },
+        });
+      }
+      if (catalog.serverTools.length > 0) {
+        this.publish({
+          channel: rec.channel,
+          action: { type: ActionType.SessionServerToolsChanged, tools: catalog.serverTools },
+        });
+      }
+    } catch (err) {
+      this.log(`external session catalog sync failed: ${errorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Re-snapshot and re-push the per-location catalog (customizations +
+   * server tools, both full-replacement) to EVERY live session — for
+   * when a shared per-location input changes after registration (an
+   * MCP server toggled): each session's panel shows the same MCP
+   * entries and tool registry, so every session converges on the new
+   * state. Reuses the per-record sync (R2-guarded; records removed
+   * mid-flight are skipped).
+   */
+  protected async reannounceCatalogs(): Promise<void> {
+    for (const rec of [...this.sessions.values()]) {
+      await this.syncExternalCatalog(rec);
+    }
   }
 
   /** Drop a session record and announce the removal on the root channel. */

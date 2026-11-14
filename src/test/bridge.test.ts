@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ChangesetOperationScope,
   ChangesetOperationStatus,
+  McpServerStatus,
   SessionStatus,
   type AgentCustomization,
   type ChatSummary,
@@ -19,17 +20,28 @@ import {
   eventLogLine,
   fileUri,
   headContentRef,
+  initialSessionState,
+  inputSchemaOf,
   mapAgentCustomizations,
   mapCatalog,
+  mapMcpServerCustomizations,
+  mapServerTools,
+  mapSkillCustomizations,
   mapV2Event,
   mapV2EventRaw,
+  mcpServerState,
   parseContentRef,
   sessionChangesetCatalog,
   sessionSummaryStatus,
+  skillDirectoryCustomization,
+  skillUri,
   snapContentRef,
   timeStamp,
   type FacadeAgent,
+  type FacadeMcpServer,
   type FacadeProvider,
+  type FacadeSkill,
+  type FacadeTool,
 } from "../bridge.js";
 
 const provider = (over: Partial<FacadeProvider> = {}): FacadeProvider => ({
@@ -309,6 +321,271 @@ describe("agentDirectoryCustomization", () => {
   it("falls back to 'workspace' for a directory without a basename", () => {
     const dir = agentDirectoryCustomization("", [facadeAgent()]);
     expect(dir.name).toBe("workspace");
+  });
+});
+
+const facadeSkill = (over: Partial<FacadeSkill> = {}): FacadeSkill => ({
+  id: "opencode",
+  name: "OpenCode",
+  path: "/home/user/.config/opencode/skills/demo/SKILL.md",
+  ...over,
+});
+
+const facadeMcpServer = (over: Partial<FacadeMcpServer> = {}): FacadeMcpServer => ({
+  name: "context7",
+  status: "connected",
+  ...over,
+});
+
+const facadeTool = (over: Partial<FacadeTool> = {}): FacadeTool => ({
+  name: "bash",
+  description: "Run a shell command",
+  ...over,
+});
+
+describe("skillUri", () => {
+  it("turns an absolute filesystem path into a file URI", () => {
+    expect(skillUri("/home/user/skills/demo/SKILL.md")).toBe(
+      "file:///home/user/skills/demo/SKILL.md",
+    );
+  });
+
+  it("passes virtual (built-in) skill URIs through unchanged", () => {
+    expect(skillUri("skill://opencode/SKILL.md")).toBe("skill://opencode/SKILL.md");
+  });
+});
+
+describe("mapSkillCustomizations", () => {
+  it("maps id = uri = the skill path, with the description passthrough", () => {
+    const [child] = mapSkillCustomizations([
+      facadeSkill({ description: "Use for questions about opencode" }),
+    ]);
+    expect(child).toEqual({
+      type: "skill",
+      id: "file:///home/user/.config/opencode/skills/demo/SKILL.md",
+      uri: "file:///home/user/.config/opencode/skills/demo/SKILL.md",
+      name: "OpenCode",
+      description: "Use for questions about opencode",
+    });
+  });
+
+  it("maps autoinvoke false to disableModelInvocation", () => {
+    const child = mapSkillCustomizations([facadeSkill({ autoinvoke: false })])[0]!;
+    expect(child.disableModelInvocation).toBe(true);
+  });
+
+  it("leaves autoinvoke true/absent without the flag", () => {
+    expect(mapSkillCustomizations([facadeSkill({ autoinvoke: true })])[0]!.disableModelInvocation).toBeUndefined();
+    expect(mapSkillCustomizations([facadeSkill()])[0]!.disableModelInvocation).toBeUndefined();
+  });
+
+  it("keeps the virtual path of a built-in skill", () => {
+    const child = mapSkillCustomizations([facadeSkill({ path: "skill://opencode/SKILL.md" })])[0]!;
+    expect(child.uri).toBe("skill://opencode/SKILL.md");
+    expect(child.id).toBe("skill://opencode/SKILL.md");
+  });
+
+  it("maps an empty list to an empty list", () => {
+    expect(mapSkillCustomizations([])).toEqual([]);
+  });
+});
+
+describe("skillDirectoryCustomization", () => {
+  it("builds a read-only, loaded skills container over the same directory", () => {
+    const dir = skillDirectoryCustomization("/tmp/opencode/ahp-scratch/project-lan", [
+      facadeSkill(),
+    ]);
+    const agents = agentDirectoryCustomization("/tmp/opencode/ahp-scratch/project-lan", [
+      facadeAgent(),
+    ]);
+    expect(dir).toEqual({
+      type: "directory",
+      id: "opencode:directory:/tmp/opencode/ahp-scratch/project-lan:skills",
+      uri: "file:///tmp/opencode/ahp-scratch/project-lan",
+      name: "project-lan",
+      enabled: true,
+      contents: "skill",
+      writable: false,
+      load: { kind: "loaded" },
+      children: [
+        {
+          type: "skill",
+          id: "file:///home/user/.config/opencode/skills/demo/SKILL.md",
+          uri: "file:///home/user/.config/opencode/skills/demo/SKILL.md",
+          name: "OpenCode",
+        },
+      ],
+    });
+    // Coexists with the agents container: same URI, distinct id,
+    // distinct contents.
+    expect(dir.uri).toBe(agents.uri);
+    expect(dir.id).not.toBe(agents.id);
+    expect(dir.contents).toBe("skill");
+    expect(agents.contents).toBe("agent");
+  });
+});
+
+describe("mcpServerState", () => {
+  it("maps the five opencode statuses to AHP MCP states", () => {
+    expect(mcpServerState(facadeMcpServer({ status: "connected" }))).toEqual({
+      kind: McpServerStatus.Ready,
+    });
+    expect(mcpServerState(facadeMcpServer({ status: "pending" }))).toEqual({
+      kind: McpServerStatus.Starting,
+    });
+    expect(mcpServerState(facadeMcpServer({ status: "disabled" }))).toEqual({
+      kind: McpServerStatus.Stopped,
+    });
+    expect(mcpServerState(facadeMcpServer({ status: "failed", error: "boom" }))).toEqual({
+      kind: McpServerStatus.Error,
+      error: { errorType: "mcp.failed", message: "boom" },
+    });
+  });
+
+  it("degrades needs_auth to an error state (opencode carries no RFC 9728 metadata)", () => {
+    const state = mcpServerState(facadeMcpServer({ status: "needs_auth", error: "sign in" }));
+    expect(state).toEqual({
+      kind: McpServerStatus.Error,
+      error: { errorType: "mcp.auth-required", message: "sign in" },
+    });
+  });
+
+  it("uses a default message when the status carries none", () => {
+    expect(mcpServerState(facadeMcpServer({ status: "failed" }))).toEqual({
+      kind: McpServerStatus.Error,
+      error: expect.objectContaining({ message: "MCP server failed to start" }),
+    });
+  });
+});
+
+describe("mapMcpServerCustomizations", () => {
+  it("maps servers to top-level entries over the session directory URI", () => {
+    const out = mapMcpServerCustomizations(
+      [facadeMcpServer(), facadeMcpServer({ name: "other", title: "Other Server" })],
+      "/tmp/opencode/ahp-scratch/project-lan",
+    );
+    expect(out).toEqual([
+      {
+        type: "mcpServer",
+        id: "opencode:mcp/context7",
+        uri: "file:///tmp/opencode/ahp-scratch/project-lan",
+        name: "context7",
+        state: { kind: McpServerStatus.Ready },
+      },
+      {
+        type: "mcpServer",
+        id: "opencode:mcp/other",
+        uri: "file:///tmp/opencode/ahp-scratch/project-lan",
+        name: "Other Server",
+        state: { kind: McpServerStatus.Ready },
+      },
+    ]);
+  });
+
+  it("maps an empty list to an empty list", () => {
+    expect(mapMcpServerCustomizations([], "/tmp/x")).toEqual([]);
+  });
+
+  it("carries a workspace disable enablement for a disabled server (absent otherwise)", () => {
+    const out = mapMcpServerCustomizations(
+      [facadeMcpServer(), facadeMcpServer({ name: "off", status: "disabled" })],
+      "/tmp/opencode/ahp-scratch/project-lan",
+    );
+    // The panel's effective-enabled value is enablement[0].enabled ?? true:
+    // without the entry the toggle would render on while the state says
+    // stopped.
+    expect(out[0]!.enablement).toBeUndefined();
+    expect(out[1]!.enablement).toEqual([
+      { kind: "workspace", uri: "file:///tmp/opencode/ahp-scratch/project-lan", enabled: false },
+    ]);
+  });
+});
+
+/** A stand-in for an Effect codec: a non-plain object with no JSON-Schema fields. */
+const SomeCodecPrototype = { decode: () => null };
+
+describe("inputSchemaOf", () => {
+  it("keeps the fields of a plain JSON-Schema object", () => {
+    expect(
+      inputSchemaOf({
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      }),
+    ).toEqual({
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    });
+  });
+
+  it("accepts a JSON-Schema object without properties/required", () => {
+    expect(inputSchemaOf({ type: "object" })).toEqual({ type: "object" });
+  });
+
+  it("rejects a JSON-Schema shape with malformed required", () => {
+    // A non-string entry — not a valid JSON-Schema `required` — degrades.
+    expect(inputSchemaOf({ type: "object", required: ["ok", 42] })).toEqual({ type: "object" });
+  });
+
+  it("degrades a Standard Schema instance to a bare object schema", () => {
+    const standard = { [Symbol.for("standard-schema")]: { version: 1, validate: () => null } };
+    expect(inputSchemaOf(standard)).toEqual({ type: "object" });
+  });
+
+  it("degrades an opaque value (an Effect codec instance) to a bare object schema", () => {
+    expect(inputSchemaOf(Object.create(SomeCodecPrototype))).toEqual({ type: "object" });
+  });
+
+  it("returns null for a missing input", () => {
+    expect(inputSchemaOf(undefined)).toBeNull();
+    expect(inputSchemaOf(null)).toBeNull();
+  });
+});
+
+describe("mapServerTools", () => {
+  it("maps name, description, and inputSchema", () => {
+    const out = mapServerTools([
+      facadeTool({ input: { type: "object", properties: { a: { type: "string" } } } }),
+    ]);
+    expect(out).toEqual([
+      {
+        name: "bash",
+        description: "Run a shell command",
+        inputSchema: { type: "object", properties: { a: { type: "string" } } },
+      },
+    ]);
+  });
+
+  it("omits the description when empty and the inputSchema when there is no input", () => {
+    const out = mapServerTools([facadeTool({ name: "noop", description: "", input: undefined })]);
+    expect(out).toEqual([{ name: "noop" }]);
+  });
+
+  it("excludes the cross-session client-tool names", () => {
+    const out = mapServerTools(
+      [facadeTool(), facadeTool({ name: "clientTool" })],
+      new Set(["clientTool"]),
+    );
+    expect(out.map((t) => t.name)).toEqual(["bash"]);
+  });
+
+  it("maps an empty list to an empty list", () => {
+    expect(mapServerTools([])).toEqual([]);
+  });
+});
+
+describe("initialSessionState (serverTools)", () => {
+  const base = { sessionID: "ses_test", provider: "gpuz", title: "t" };
+
+  it("carries serverTools when non-empty", () => {
+    const state = initialSessionState({ ...base, serverTools: [{ name: "bash" }] });
+    expect(state.serverTools).toEqual([{ name: "bash" }]);
+  });
+
+  it("omits serverTools when absent or empty", () => {
+    expect(initialSessionState(base).serverTools).toBeUndefined();
+    expect(initialSessionState({ ...base, serverTools: [] }).serverTools).toBeUndefined();
   });
 });
 

@@ -3,8 +3,8 @@
  */
 
 import { HostSessions } from "./host-sessions.js";
-import { ActionType, SessionInputRequestKind, SessionStatus, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
-import { FacadeDelivery } from "./bridge.js";
+import { ActionType, SessionInputRequestKind, SessionStatus, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
+import { FacadeDelivery, MCP_CUSTOMIZATION_ID_PREFIX } from "./bridge.js";
 import { normalizeToolDefinitions } from "./client-tools.js";
 import { channelKind, parseChangesetChannel } from "./channels.js";
 import { isRecord } from "./options.js";
@@ -164,6 +164,11 @@ export class HostDispatch extends HostSessions {
       case ActionType.SessionIsArchivedChanged:
         this.echo(channel, stateAction, origin);
         return;
+      case ActionType.SessionCustomizationToggled:
+      case ActionType.SessionMcpServerStartRequested:
+      case ActionType.SessionMcpServerStopRequested:
+        await this.dispatchMcpControl(channel, stateAction, origin);
+        return;
       default:
         this.echo(channel, stateAction, origin, `unsupported action: ${String(stateAction.type)}`);
     }
@@ -185,6 +190,66 @@ export class HostDispatch extends HostSessions {
     if (!dispatchable) return `action ${String(action.type)} is not client-dispatchable`;
     if (clientId === null) return "client is not initialized";
     return null;
+  }
+
+  /**
+   * MCP-server toggle (design §7.5): the panel's enable toggle
+   * (`session/customizationToggled` on an `opencode:mcp/<name>` id) and
+   * the dedicated control actions (`session/mcpServerStartRequested` /
+   * `mcpServerStopRequested`) all map to the facade's `setMcpDisabled`
+   * — opencode's `disabled` config flag layered over the file config by
+   * the plugin's MCP transform, followed by the MCP re-reconcile the
+   * reload awaits. Once the status is settled, the accepted echo goes
+   * out and the per-location catalog is re-snapshotted and re-pushed to
+   * every live session, so each panel's entry converges on the new
+   * `state` (stopped / ready / …) and the `enablement` its toggle reads.
+   * Every other customization (agents, skills, directories) is a static
+   * file/config definition opencode cannot disable — rejected, so the
+   * write-ahead client rolls the toggle back.
+   */
+  private async dispatchMcpControl(
+    channel: string,
+    stateAction: StateAction,
+    origin: ActionOrigin | undefined,
+  ): Promise<void> {
+    const a = stateAction as
+      | SessionCustomizationToggledAction
+      | SessionMcpServerStartRequestedAction
+      | SessionMcpServerStopRequestedAction;
+    const id = typeof a.id === "string" ? a.id : undefined;
+    if (id === undefined || !id.startsWith(MCP_CUSTOMIZATION_ID_PREFIX)) {
+      this.echo(
+        channel,
+        stateAction,
+        origin,
+        a.type === ActionType.SessionCustomizationToggled
+          ? "cannot toggle: only MCP servers are togglable on this host — agents and skills are static file/config definitions"
+          : "cannot start or stop: only MCP servers accept start/stop on this host",
+      );
+      return;
+    }
+    const name = id.slice(MCP_CUSTOMIZATION_ID_PREFIX.length);
+    let disabled: boolean;
+    if (a.type === ActionType.SessionMcpServerStopRequested) {
+      disabled = true;
+    } else if (a.type === ActionType.SessionMcpServerStartRequested) {
+      disabled = false;
+    } else {
+      // `session/customizationToggled`: the effective decision is the
+      // most specific entry — the protocol allows treating
+      // `enablement[0].enabled ?? true` as the effective enabled value
+      // (absent or empty array = enabled).
+      const first = Array.isArray(a.enablement) ? a.enablement[0] : undefined;
+      disabled = !(first?.enabled ?? true);
+    }
+    try {
+      await this.opts.facade.setMcpDisabled(name, disabled);
+    } catch (err) {
+      this.echo(channel, stateAction, origin, `mcp toggle failed: ${errorMessage(err)}`);
+      return;
+    }
+    this.echo(channel, stateAction, origin);
+    await this.reannounceCatalogs();
   }
 
   // `echo` (accepted echoes + write-ahead rejections) lives on HostBase

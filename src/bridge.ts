@@ -14,8 +14,10 @@ import { sessionChangesetURI, turnChangesetURI, uncommittedChangesetURI } from "
 import {
   ChangesetOperationScope,
   ChangesetOperationStatus,
+  CustomizationEnablementKind,
   CustomizationLoadStatus,
   CustomizationType,
+  McpServerStatus,
   MessageKind,
   SessionLifecycle,
   SessionStatus,
@@ -29,11 +31,15 @@ import {
   type Customization,
   type DirectoryCustomization,
   type FileEdit,
+  type McpServerCustomization,
+  type McpServerState,
   type Message,
   type SessionActiveClient,
   type SessionState,
   type SessionSummary,
   type SessionModelInfo,
+  type SkillCustomization,
+  type ToolDefinition,
 } from "@microsoft/agent-host-protocol";
 
 export type ProviderActivation = "auto" | "enabled" | "disabled";
@@ -71,6 +77,51 @@ export interface FacadeAgent {
   mode: FacadeAgentMode;
   /** Internal agents (summary/title/compaction/…) — never surfaced. */
   hidden: boolean;
+}
+
+/**
+ * An opencode MCP server's connection status (opencode `Mcp.Status`).
+ * The status, not the config: `ctx.mcp.list()` reports what is
+ * configured for the location as it stands right now.
+ */
+export type FacadeMcpStatus = "connected" | "pending" | "disabled" | "failed" | "needs_auth";
+
+/**
+ * Narrow opencode MCP server, from `ctx.mcp.list()`. `title` is the
+ * configured display name; `error` carries detail text for
+ * `failed` / `needs_auth` only.
+ */
+export interface FacadeMcpServer {
+  name: string;
+  title?: string;
+  status: FacadeMcpStatus;
+  error?: string;
+}
+
+/**
+ * Narrow opencode skill, from `ctx.skill.list()`. `path` is an
+ * absolute filesystem path for on-disk skills, or a virtual URI for
+ * built-in ones (`skill://…`).
+ */
+export interface FacadeSkill {
+  id: string;
+  name: string;
+  description?: string;
+  /** Absent or `true` = the model may auto-invoke; `false` = user-selected only. */
+  autoinvoke?: boolean;
+  path: string;
+}
+
+/**
+ * Narrow opencode tool, from `ctx.tool.list()`. `input` is the raw
+ * `Tool.Info.input` — an Effect codec, a Standard Schema instance, or
+ * a plain JSON-Schema object (the mapper is shape-detecting; the
+ * bridge keeps no schema-library dependency).
+ */
+export interface FacadeTool {
+  name: string;
+  description?: string;
+  input?: unknown;
 }
 
 export interface FacadeModelRef {
@@ -191,6 +242,25 @@ export interface OpencodeFacade {
   listCatalog(): Promise<readonly FacadeProvider[]>;
   /** Live opencode agents (`ctx.agent.list()`). */
   listAgents(): Promise<readonly FacadeAgent[]>;
+  // ── session customization catalog ────────────────────────────
+  /**
+   * The MCP servers configured for this location (`ctx.mcp.list()`) —
+   * names with their current connection status.
+   */
+  listMcpServers(): Promise<readonly FacadeMcpServer[]>;
+  /** The skills available in this location (`ctx.skill.list()`). */
+  listSkills(): Promise<readonly FacadeSkill[]>;
+  /** The tools registered in this location (`ctx.tool.list()`). */
+  listTools(): Promise<readonly FacadeTool[]>;
+  /**
+   * Toggle the `disabled` flag of a configured MCP server and re-reconcile
+   * the MCP registry (`ctx.mcp.transform` + `ctx.mcp.reload`). A disabled
+   * server is disconnected and reports status `disabled`; a re-enabled one
+   * connects again and the reload resolves only once the status is
+   * settled. Runtime-only: the config file is untouched and the decision
+   * is lost on location restart/reload.
+   */
+  setMcpDisabled(name: string, disabled: boolean): Promise<void>;
   // ── sessions ─────────────────────────────────────────────────
   /**
    * Create an opencode session. `id` is only passed through when it is a
@@ -430,6 +500,214 @@ export function agentDirectoryCustomization(
     load: { kind: CustomizationLoadStatus.Loaded },
     children: mapAgentCustomizations(agents),
   };
+}
+
+/**
+ * A skill's `path` as a customization URI: an absolute filesystem
+ * path becomes a `file://` URI; a virtual path (built-in skills use
+ * `skill://…`) is already URI-shaped and passes through. Both are
+ * stable per skill, and id = uri (the host is the minting publisher).
+ */
+export function skillUri(path: string): string {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(path) ? path : pathToFileURL(path).href;
+}
+
+/**
+ * Map opencode skills to AHP `SkillCustomization` children:
+ *  - `id` = `uri` = the skill's `path` (see {@link skillUri});
+ *  - `autoinvoke === false` → `disableModelInvocation: true` (the
+ *    model must not pick it; the user can still select it);
+ *  - `description` passes through.
+ */
+export function mapSkillCustomizations(skills: readonly FacadeSkill[]): SkillCustomization[] {
+  const out: SkillCustomization[] = [];
+  for (const skill of skills) {
+    const uri = skillUri(skill.path);
+    const child: SkillCustomization = {
+      type: CustomizationType.Skill,
+      id: uri,
+      uri,
+      name: skill.name,
+    };
+    if (skill.description !== undefined) child.description = skill.description;
+    if (skill.autoinvoke === false) child.disableModelInvocation = true;
+    out.push(child);
+  }
+  return out;
+}
+
+/**
+ * The skills directory container that carries the skill children —
+ * the sibling of {@link agentDirectoryCustomization}. A
+ * `DirectoryCustomization` holds a single child type
+ * (`contents` is singular), so skills get their own container over
+ * the same directory URI; the id is suffixed so both coexist in
+ * `SessionState.customizations`.
+ */
+export function skillDirectoryCustomization(
+  directory: string,
+  skills: readonly FacadeSkill[],
+): DirectoryCustomization {
+  const name = directory.split(/[\\/]/).filter(Boolean).pop() ?? "workspace";
+  return {
+    type: CustomizationType.Directory,
+    id: `opencode:directory:${directory}:skills`,
+    uri: pathToFileURL(directory).href,
+    name,
+    enabled: true,
+    contents: CustomizationType.Skill,
+    writable: false,
+    load: { kind: CustomizationLoadStatus.Loaded },
+    children: mapSkillCustomizations(skills),
+  };
+}
+
+/** The id prefix of the host's MCP-server customization entries. */
+export const MCP_CUSTOMIZATION_ID_PREFIX = "opencode:mcp/";
+
+/**
+ * opencode's `Mcp.Status` → AHP `McpServerState`:
+ *  - `connected` → ready, `pending` → starting, `disabled` → stopped;
+ *  - `failed` → error (the status carries a message);
+ *  - `needs_auth` → error too: AHP's `auth-required` state requires
+ *    the RFC 9728 `ProtectedResourceMetadata` (an https `resource`
+ *    URI), which opencode's status does not carry (message only) —
+ *    the degradation keeps the panel honest without inventing a
+ *    resource identifier.
+ */
+export function mcpServerState(server: FacadeMcpServer): McpServerState {
+  switch (server.status) {
+    case "connected":
+      return { kind: McpServerStatus.Ready };
+    case "pending":
+      return { kind: McpServerStatus.Starting };
+    case "disabled":
+      return { kind: McpServerStatus.Stopped };
+    case "needs_auth":
+      return {
+        kind: McpServerStatus.Error,
+        error: {
+          errorType: "mcp.auth-required",
+          message: server.error ?? "MCP server requires authentication",
+        },
+      };
+    case "failed":
+      return {
+        kind: McpServerStatus.Error,
+        error: { errorType: "mcp.failed", message: server.error ?? "MCP server failed to start" },
+      };
+  }
+}
+
+/**
+ * Map opencode MCP servers to **top-level** AHP
+ * `McpServerCustomization` entries — the protocol's slot for a
+ * "globally-configured MCP server that isn't bundled in a plugin or
+ * directory":
+ *  - `id` = `opencode:mcp/<name>` (stable per configured server);
+ *  - `uri` = the session's directory URI (the server is configured
+ *    for that directory's location — the closest provenance the
+ *    status list carries);
+ *  - `name` = the configured display title, falling back to the
+ *    config name;
+ *  - `enablement` = a single Workspace entry with `enabled: false`
+ *    for a server whose status is `disabled` (file- or toggle-
+ *    disabled — the status list does not distinguish). The panel's
+ *    effective-enabled value is `enablement[0].enabled ?? true`, so
+ *    an enabled server omits the field; without it the client would
+ *    render the toggle as on while the state says `stopped`.
+ *
+ * Snapshot semantics: the state is whatever opencode reports when the
+ * session registers (or when the host re-snapshots after an MCP
+ * toggle — the re-push replaces the full customization list).
+ * opencode's `mcp.status.changed` event carries only the server name
+ * (no state payload) and is not otherwise acted on, so the host
+ * re-snapshots per registration rather than live-pushing (futures.md).
+ */
+export function mapMcpServerCustomizations(
+  servers: readonly FacadeMcpServer[],
+  directory: string,
+): McpServerCustomization[] {
+  const uri = pathToFileURL(directory).href;
+  return servers.map((server) => ({
+    type: CustomizationType.McpServer,
+    id: `${MCP_CUSTOMIZATION_ID_PREFIX}${server.name}`,
+    uri,
+    name: server.title ?? server.name,
+    state: mcpServerState(server),
+    ...(server.status === "disabled"
+      ? { enablement: [{ kind: CustomizationEnablementKind.Workspace, uri, enabled: false }] }
+      : {}),
+  }));
+}
+
+/**
+ * A facade tool's raw `input` as an AHP `inputSchema`, or null when
+ * there is no input at all. The AHP shape is fixed
+ * (`{ type: "object", properties?, required? }`); opencode's
+ * `Tool.Info.input` is a union of three value-schema forms, and the
+ * bridge stays dependency-free, so the mapping is shape-detecting:
+ *  - a plain JSON-Schema object literal → keep `type` / `properties`
+ *    / `required` (the fields AHP accepts), validated in shape;
+ *  - a Standard Schema v1 instance (branded
+ *    `Symbol.for("standard-schema")`), an Effect codec, or any other
+ *    opaque object → degrade to `{ type: "object" }` — the input is
+ *    always an object, but no JSON-Schema shape is extractable
+ *    without a schema compiler;
+ *  - anything that is not an object (no input) → null (no
+ *    `inputSchema` at all).
+ */
+export function inputSchemaOf(input: unknown): ToolDefinition["inputSchema"] | null {
+  if (input === null || typeof input !== "object") return null;
+  const candidate = input as Record<string, unknown>;
+  if (
+    candidate["type"] === "object" &&
+    (candidate["properties"] === undefined ||
+      (typeof candidate["properties"] === "object" && candidate["properties"] !== null)) &&
+    (candidate["required"] === undefined ||
+      (Array.isArray(candidate["required"]) &&
+        candidate["required"].every((r) => typeof r === "string")))
+  ) {
+    const schema: NonNullable<ToolDefinition["inputSchema"]> = { type: "object" };
+    if (candidate["properties"] !== undefined) {
+      schema.properties = candidate["properties"] as Record<string, object>;
+    }
+    if (Array.isArray(candidate["required"])) {
+      schema.required = candidate["required"] as string[];
+    }
+    return schema;
+  }
+  // Opaque schema forms (Standard Schema brand, Effect codec, …).
+  return { type: "object" };
+}
+
+/**
+ * Map the opencode tool registry to AHP `ToolDefinition[]` (the
+ * session's `serverTools`):
+ *  - `input` → `inputSchema` via {@link inputSchemaOf} (absent input
+ *    omits the field);
+ *  - `excluded` — names the cross-session union of every live
+ *    session's active-client tools registers in the same location
+ *    registry — are dropped: those tools already reach the model
+ *    (and the client) through the client itself and must not echo
+ *    back as server tools.
+ */
+export function mapServerTools(
+  tools: readonly FacadeTool[],
+  excluded: ReadonlySet<string> = new Set(),
+): ToolDefinition[] {
+  const out: ToolDefinition[] = [];
+  for (const tool of tools) {
+    if (excluded.has(tool.name)) continue;
+    const def: ToolDefinition = { name: tool.name };
+    if (tool.description !== undefined && tool.description.length > 0) {
+      def.description = tool.description;
+    }
+    const inputSchema = inputSchemaOf(tool.input);
+    if (inputSchema !== null) def.inputSchema = inputSchema;
+    out.push(def);
+  }
+  return out;
 }
 
 /**
@@ -834,9 +1112,13 @@ export function modelRefString(model?: FacadeModelRef): string | null {
  * `status` starts at `Idle | IsRead` (33) — the session reducer can only
  * move the read/archive/input-needed bits, so the *activity* source of
  * truth is the chat status (synced via `session/chatUpdated`).
- * `customizations` carries the workspace agent directory container — the
- * same one the root catalog builds — because VS Code's agent dropdown reads
- * `SessionState.customizations` (root-state customizations are NOT read).
+ * `customizations` carries the session customization catalog (design
+ * §7.5) — the workspace agent directory container, the sibling skills
+ * directory container, and the top-level MCP server entries — because
+ * VS Code's agent dropdown and Customizations panel read
+ * `SessionState.customizations` (root-state customizations are NOT
+ * read). `serverTools` carries the host-side tool list (opencode's
+ * registry minus client-contributed tools).
  */
 export function initialSessionState(input: {
   sessionID: string;
@@ -844,6 +1126,8 @@ export function initialSessionState(input: {
   title: string;
   activeClients?: SessionActiveClient[];
   customizations?: Customization[];
+  /** The session's `serverTools` (AHP `SessionState.serverTools`). */
+  serverTools?: ToolDefinition[];
   status?: SessionStatus;
   changesets?: Changeset[];
   /**
@@ -869,6 +1153,9 @@ export function initialSessionState(input: {
       : {}),
     ...(input.customizations !== undefined && input.customizations.length > 0
       ? { customizations: input.customizations }
+      : {}),
+    ...(input.serverTools !== undefined && input.serverTools.length > 0
+      ? { serverTools: input.serverTools }
       : {}),
     ...(input.changesets !== undefined ? { changesets: input.changesets } : {}),
   };

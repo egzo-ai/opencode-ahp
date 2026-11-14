@@ -245,6 +245,59 @@ several repositories is a natural shape. The rest is bookkeeping around a
 directory set the agent cannot yet act on — which is why this stays
 potential.
 
+### 1.6 Live re-push of the session customization catalog
+
+**What shipped.** The session customization catalog (design.md
+[§7.5](design.md#75-session-customization-catalog)) — the skills
+directory container, the top-level MCP server entries with their live
+status, and `serverTools` — is published as a **per-registration
+snapshot**: `createSession` bakes it into the session's initial state,
+and an external registration publishes it as a fire-and-forget
+change-action pair after the root announcement. An MCP toggle is the
+one live exception: when a client disables or enables a server
+(`session/customizationToggled`, `mcpServerStart/StopRequested`), the
+host re-snapshots after the awaited re-reconcile and re-pushes the
+full catalog to every live session (design.md
+[§7.5](design.md#75-session-customization-catalog), **Toggling**).
+
+**The residual: the catalog does not update on opencode-side changes
+during a session's lifetime** (the one live update, the MCP toggle,
+re-pushes deterministically after its awaited re-reconcile — not from
+a change event). Three gaps, each with a different blocker:
+
+- **MCP status changes — implementable today.** `mcp.status.changed`
+  is on the public event stream the plugin subscribes to (the v2.2.6
+  `EventManifest.Server` inventory), but it carries only the server
+  name — no state payload. A live re-push would be pure host-side
+  work: re-snapshot `ctx.mcp.list()` on the event and publish
+  `session/customizationsChanged` (full replacement) on the
+  registered sessions. It stays potential because the trigger is
+  coarse (the event fires whenever a server's status settles — a
+  healthy server's reconnect included) and no client in the field
+  asks for sub-registration freshness in the Customizations panel.
+- **MCP tool changes — upstream blocker.** `mcp.tools.changed` is
+  *not* in the v2.2.6 `EventManifest.Server` inventory: an untyped
+  `ctx.event.subscribe` delivers only that inventory (plus `rpc.*`),
+  and a typed subscribe resolves against the same inventory — the
+  plugin cannot observe the event at all. Re-pushing `serverTools`
+  when an MCP server adds or removes tools needs opencode to put the
+  event on the public stream ([§4.1](#41-opencode--feature-requests-to-file),
+  item 9). AHP 1.0.0 has no slot for MCP *resources* either — the
+  `Customization` union has no resource type — so
+  `mcp.resources.changed` has nowhere to map.
+- **Client-tool union changes — design choice.** A
+  `session/activeClientSet` on any session re-syncs the
+  location-global opencode tool registry (design.md
+  [§10](design.md#10-client-provided-tools)) but does not re-snapshot
+  the `serverTools` of existing sessions — the union is re-read at
+  (re-)registration. Re-pushing on every `activeClientSet` would
+  churn every session's panel state; the display-only staleness is
+  accepted (design.md §7.5).
+
+None of the three changes session behavior — the catalog is
+display-only — so the trigger for any of it is a client that needs
+live freshness in the Customizations panel.
+
 ---
 
 ## 2. The AHP 1.0.0 surface the host does not implement
@@ -312,15 +365,23 @@ back it.
 - `workingDirectorySet` / `workingDirectoryRemoved` /
   `workingDirectoryReplaced` — same multiroot reason as above
   ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)).
-- `customizationToggled` — toggle a customization on/off; opencode's
-  agents are static file/config definitions, and the plugin surface has
-  no agent enable/disable toggle.
-- `mcpServerStartRequested` / `mcpServerBackgroundRequested` /
-  `mcpServerStopRequested` — MCP server control. `ctx.mcp` is
-  **config-level only** (`list` + a `transform` hook over server configs
-  - `reload`); there is no runtime server state (starting / ready /
-  authRequired / error / stopped) and no start/stop control, and the
-  host does not expose MCP servers as session customizations at all.
+- `customizationToggled` — honored for the host's MCP ids
+  (`opencode:mcp/<name>`); **still unhandled for every other
+  customization**: opencode's agents, skills, and directories are
+  static file/config definitions with no enable/disable toggle, so the
+  dispatch rejects them with the static-definition reason (design.md
+  [§7.5](design.md#75-session-customization-catalog), **Toggling**).
+- `mcpServerStartRequested` / `mcpServerStopRequested` — honored for
+  MCP ids via the same `disabled`-flag mechanism (design.md
+  [§7.5](design.md#75-session-customization-catalog), **Toggling**);
+  non-MCP ids rejected. (The mechanism is the plugin's
+  `transform` + `reload` seam — no server API `mcp.connect` /
+  `mcp.disconnect` is involved; those remain absent from the plugin
+  ctx and unneeded.)
+- `mcpServerBackgroundRequested` — unhandled: opencode's re-reconcile
+  settles the connection either way (the reload awaits it), so there
+  is no blocking-versus-background start distinction to back the
+  action.
 - `configChanged` — 1.1.0-in-flight ([§3.2](#32-what-is-in-flight-on-upstream-main));
   not part of the 1.0.0 wire; listed for completeness.
 
@@ -471,11 +532,18 @@ Ordered by impact. Findings verified against v2.2.6 source and current
    ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)); until
    then any additional working directory would be metadata-only to the
    agent. No client in the field drives it today.
+ 9. **`mcp.tools.changed` on the public event stream** — the event
+   exists (ephemeral, `{ server }`) but is absent from the
+   `EventManifest.Server` inventory a plugin's event subscription
+   delivers (v2.2.6); adding it would let the host re-push
+   `serverTools` when an MCP server adds or removes tools
+   ([§1.6](#16-live-re-push-of-the-session-customization-catalog)).
+   Long-term; no current client need.
 
 Impact note: #1 changes the deployment UX (zero-touch boot), #2 removes
 the mandatory config entry (the idle timeout), #4 is the only path to
 remote elicitation — the three that change the shape of the product.
-#3 and #5–#8 are on-demand feature unlocks.
+#3 and #5–#9 are on-demand feature unlocks.
 
 ### 4.2 VS Code — upstream requests & watches
 
