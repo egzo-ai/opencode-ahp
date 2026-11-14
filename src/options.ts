@@ -35,6 +35,15 @@ export interface Options {
   token: string | null;
   /** Origin allowlist; the token is always required regardless. */
   allowedOrigins: string[] | "*";
+  /**
+   * Directory allowlist — absolute path prefixes (design §3.3). Empty
+   * (default) → unrestricted. Non-empty: a client-named path must resolve
+   * under one of the prefixes (after symlink resolution) — the
+   * `createSession.workingDirectories` target and the unconfined
+   * `resource*` commands. A non-absolute entry is a configuration error:
+   * the host fails closed (AHP off).
+   */
+  allowedWorkingDirectories: string[];
   /** Native TLS via Bun.serve on the same listener (off-LAN). */
   tls: TlsOptions | null;
   /** Plain-HTTP health endpoint (no auth). */
@@ -59,6 +68,9 @@ export const BUILTIN_OPTIONS: Options = {
   path: "/ahp",
   token: null,
   allowedOrigins: "*",
+  // No restriction by default (an opt-in hardening); a non-absolute entry
+  // is a configuration error the plugin entry fails closed on.
+  allowedWorkingDirectories: [],
   tls: null,
   healthPath: "/healthz",
   replayWindow: 1000,
@@ -93,6 +105,13 @@ function validateAllowedOrigins(v: unknown): string[] | "*" | null {
   if (v === "*") return "*";
   if (isNonEmptyStrArray(v)) return [...v];
   return null;
+}
+
+/** A directory-allowlist value: an array of non-empty strings. */
+function validateAllowedDirs(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  if (!v.every((x) => typeof x === "string" && x.length > 0)) return null;
+  return [...v];
 }
 
 function validateTls(v: unknown): TlsOptions | null {
@@ -236,6 +255,9 @@ export function resolveOptions(
     allowedOrigins:
       pickNullable("allowedOrigins", validateAllowedOrigins, BUILTIN_OPTIONS.allowedOrigins) ??
       BUILTIN_OPTIONS.allowedOrigins,
+    allowedWorkingDirectories:
+      pickNullable("allowedWorkingDirectories", validateAllowedDirs, BUILTIN_OPTIONS.allowedWorkingDirectories) ??
+      BUILTIN_OPTIONS.allowedWorkingDirectories,
     tls: pickNullable("tls", validateTls, BUILTIN_OPTIONS.tls),
     healthPath: pick("healthPath", isUrlPath, BUILTIN_OPTIONS.healthPath),
     replayWindow: pick("replayWindow", isPosInt, BUILTIN_OPTIONS.replayWindow),

@@ -49,11 +49,14 @@ import {
 import { ERROR_INVALID_PARAMS } from "../handshake.js";
 import {
   ERROR_INTERNAL,
+  ERROR_INVALID_REQUEST,
   ERROR_NO_PROVIDER,
+  ERROR_PERMISSION_DENIED,
   ERROR_SESSION_EXISTS,
   ERROR_SESSION_NOT_FOUND,
   Host,
 } from "../host.js";
+import { PathPolicy, type PathPolicyEnv } from "../path-policy.js";
 import type { SpawnPty, SpawnPtyInput } from "../host-types.js";
 
 // ── fixtures / helpers ────────────────────────────────────────────────────
@@ -480,6 +483,8 @@ interface Harness {
   stop: () => void;
   /** The FakePty instances spawned so far, in spawn order. */
   ptys: FakePty[];
+  /** Host log lines, in order. */
+  logs: string[];
 }
 
 function makeHarness(opts?: {
@@ -488,10 +493,13 @@ function makeHarness(opts?: {
   /** The spawnPty seam; null omits the option entirely (the -32601 path),
    * undefined uses the default fake that captures into `ptys`. */
   spawnPty?: SpawnPty | null;
+  /** The directory allowlist; undefined omits the option (unrestricted). */
+  pathPolicy?: PathPolicy;
 }): Harness {
   const facade = new FakeFacade();
   const frames: Frame[] = [];
   const ptys: FakePty[] = [];
+  const logs: string[] = [];
   const host = new Host({
     serverInfo: { name: "opencode-ahp-test", version: "0.1.0" },
     facade,
@@ -499,6 +507,7 @@ function makeHarness(opts?: {
     defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
     changesets: opts?.changesets ?? true,
     terminals: opts?.terminals ?? true,
+    ...(opts?.pathPolicy !== undefined ? { pathPolicy: opts.pathPolicy } : {}),
     ...(opts?.spawnPty === null
       ? {}
       : {
@@ -511,7 +520,7 @@ function makeHarness(opts?: {
             }),
         }),
     send: (socketId, message) => frames.push({ socketId, message: message as Record<string, any> }),
-    log: () => {},
+    log: (message) => logs.push(message),
   });
   host.startEventPump();
   return {
@@ -519,6 +528,7 @@ function makeHarness(opts?: {
     facade,
     frames,
     ptys,
+    logs,
     send: (socketId, method, params, id) => {
       host.onMessage(socketId, JSON.stringify(id === undefined ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", method, params, id }));
     },
@@ -791,6 +801,101 @@ describe("createSession", () => {
       expect(res.error?.code).toBe(ERROR_INVALID_PARAMS);
     }
     expect(h.facade.createCalls).toHaveLength(0);
+    h.stop();
+  });
+});
+
+// ── non-standard (legacy) session channels ────────────────────────────
+// VS Code's legacy addressing (hosts predating the vscode.ahpSessionUris
+// capability) and the AHP reference client create sessions under
+// <provider>:/<uuid> instead of ahp-session:/<uuid>. The host accepts
+// the form and echoes the channel back verbatim (design §6).
+
+describe("non-standard (legacy) session channels", () => {
+  it("createSession accepts a <provider>:/<uuid> channel and serves it end-to-end", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const legacy = "copilot:/d6df6b12-1111-4111-8111-111111111111";
+    const res = await createSession(h, 1, legacy, { provider: "gpuz" });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+
+    // The root announcement carries the client's channel verbatim.
+    const added = h.notification("root/sessionAdded", 1);
+    expect(added!.params.summary.resource).toBe(legacy);
+
+    // The legacy channel is subscribable — it classifies "unknown" by
+    // prefix and resolves through the registry's session-channel set.
+    const sess = await sessionSnapshotState(h, 1, legacy, 101);
+    expect(sess.lifecycle).toBe("ready");
+    expect(sess.chats).toHaveLength(1);
+    expect(sess.defaultChat).toBe(chatChannelURI(h.facade.createdIds[0]!));
+
+    // createChat accepts the legacy session channel as the owner.
+    const chat = await createChat(h, 1, { channel: legacy, chat: "ahp-chat:/legacy-peer" }, 102);
+    expect(chat.error).toBeUndefined();
+
+    // A duplicate uses the exact channel string.
+    const dup = await createSession(h, 1, legacy, {}, 103);
+    expect(dup.error?.code).toBe(ERROR_SESSION_EXISTS);
+    h.stop();
+  });
+
+  it("rejects non-session channels with -32602 and logs the offending channel", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const bad: (string | undefined)[] = [
+      "ahp-chat:/x",
+      ROOT_CHANNEL,
+      "file:///tmp/opencode/ahp-scratch",
+      "copilot://x", // authority — not the legacy form
+      "copilot:/", // empty suffix
+      undefined, // missing channel
+    ];
+    for (let i = 0; i < bad.length; i++) {
+      const id = 100 + i;
+      h.send(1, "createSession", bad[i] === undefined ? {} : { channel: bad[i] }, id);
+      await waitFor(
+        () => h.frames.some((f) => f.socketId === 1 && f.message.id === id && (f.message.result !== undefined || f.message.error)),
+        `createSession response (${id})`,
+      );
+      const msg = h.frames.find((f) => f.socketId === 1 && f.message.id === id)!.message;
+      expect(msg.error?.code).toBe(ERROR_INVALID_PARAMS);
+    }
+    expect(h.facade.createCalls).toHaveLength(0);
+    // The rejection is logged with the offending channel — this path used
+    // to go out silently, making a client's channel error unattributable.
+    const logged = h.logs.filter((l) => l.startsWith("createSession rejected: channel is not a session URI"));
+    expect(logged).toHaveLength(bad.length);
+    expect(logged[0]!.includes('"ahp-chat:/x"')).toBe(true);
+    h.stop();
+  });
+
+  it("keeps the session-channel and terminal-channel sets disjoint", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // A pty terminal on the same URI form as a legacy session channel
+    // (VS Code mints agenthost-terminal:/<uuid> for pty terminals).
+    const uri = "agenthost-terminal:/term-1";
+    h.send(1, "createTerminal", { channel: uri, claim: { kind: "client", clientId: "c1" } }, 900);
+    await waitFor(() => h.frames.some((f) => f.message.id === 900 && (f.message.result !== undefined || f.message.error)), "createTerminal response");
+    expect(h.frames.find((f) => f.message.id === 900)!.message.error).toBeUndefined();
+
+    // A session cannot take a live terminal channel.
+    const clash = await createSession(h, 1, uri, {}, 901);
+    expect(clash.error?.code).toBe(ERROR_INVALID_PARAMS);
+    expect(h.logs.some((l) => l.includes("live terminal channel"))).toBe(true);
+
+    // A terminal cannot take a live (legacy) session channel.
+    const legacy = "copilot:/sess-clash";
+    const created = await createSession(h, 1, legacy, {}, 902);
+    expect(created.error).toBeUndefined();
+    h.send(1, "createTerminal", { channel: legacy, claim: { kind: "client", clientId: "c1" } }, 903);
+    await waitFor(() => h.frames.some((f) => f.message.id === 903 && (f.message.result !== undefined || f.message.error)), "createTerminal response");
+    expect(h.frames.find((f) => f.message.id === 903)!.message.error?.code).toBe(ERROR_INVALID_REQUEST);
     h.stop();
   });
 });
@@ -2259,6 +2364,129 @@ describe("resource* (resolve/list/mkdir)", () => {
   });
 });
 
+describe("directory allowlist (allowedWorkingDirectories)", () => {
+  const PREFIX = "/allowed";
+  const OUTSIDE = "/outside";
+  /** The identity resolver — no symlinks in the decision. */
+  const identityEnv: PathPolicyEnv = { resolveExisting: (p) => Promise.resolve(p) };
+
+  async function ready(h: Harness): Promise<void> {
+    h.init(1, "c1");
+    await waitInit(h, 1);
+  }
+
+  it("createSession: a working directory outside the prefixes → flat -32009, no backend session", async () => {
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], identityEnv) });
+    await ready(h);
+    const res = await createSession(h, 1, sessionChannelURI("pol-sess"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(OUTSIDE)],
+    });
+    expect(res.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(res.error?.message).toBe("working directory is not permitted by host policy");
+    expect(h.facade.createCalls).toHaveLength(0);
+    h.stop();
+  });
+
+  it("createSession: a working directory under a prefix proceeds to the backend", async () => {
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], identityEnv) });
+    await ready(h);
+    const res = await createSession(h, 1, sessionChannelURI("pol-ok"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(`${PREFIX}/proj`)],
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    expect(h.facade.createCalls[0]!.location).toEqual({ directory: `${PREFIX}/proj` });
+    h.stop();
+  });
+
+  it("createSession: an undecidable resolution defers (the operation runs)", async () => {
+    const failing: PathPolicyEnv = {
+      resolveExisting: () => {
+        throw new Error("EACCES");
+      },
+    };
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], failing) });
+    await ready(h);
+    const res = await createSession(h, 1, sessionChannelURI("pol-defer"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(`${PREFIX}/proj`)],
+    });
+    expect(res.error).toBeUndefined();
+    expect(h.facade.createCalls[0]!.location).toEqual({ directory: `${PREFIX}/proj` });
+    h.stop();
+  });
+
+  it("createSession: a symlink out of a prefix is denied (resolved form is checked)", async () => {
+    const env: PathPolicyEnv = {
+      resolveExisting: (p) =>
+        Promise.resolve(
+          p === `${PREFIX}/link` || p.startsWith(`${PREFIX}/link/`)
+            ? `${OUTSIDE}${p.slice(`${PREFIX}/link`.length)}`
+            : p,
+        ),
+    };
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], env) });
+    await ready(h);
+    const res = await createSession(h, 1, sessionChannelURI("pol-link"), {
+      provider: "gpuz",
+      workingDirectories: [directoryUri(`${PREFIX}/link`)],
+    });
+    expect(res.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(h.facade.createCalls).toHaveLength(0);
+    h.stop();
+  });
+
+  it("resource* commands: outside the prefixes → flat -32009, no facade effect", async () => {
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], identityEnv) });
+    await ready(h);
+    h.facade.dirs.add(OUTSIDE);
+    h.facade.disk.set(`${OUTSIDE}/f.txt`, "x");
+    const list = await rpc(h, "resourceList", { uri: directoryUri(OUTSIDE) }, 390);
+    expect(list.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(list.error?.message).toBe("path is not permitted by host policy");
+    const resolve = await rpc(h, "resourceResolve", { uri: directoryUri(OUTSIDE) }, 391);
+    expect(resolve.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(resolve.error?.message).toBe(list.error?.message); // same flat message — no oracle
+    const target = `${OUTSIDE}/new-dir`;
+    const mkdir = await rpc(h, "resourceMkdir", { uri: directoryUri(target) }, 392);
+    expect(mkdir.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(h.facade.dirs.has(target)).toBe(false); // no creation happened
+    h.stop();
+  });
+
+  it("resource* commands: under a prefix proceed", async () => {
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], identityEnv) });
+    await ready(h);
+    h.facade.dirs.add(PREFIX);
+    h.facade.disk.set(`${PREFIX}/readme.txt`, "x");
+    const list = await rpc(h, "resourceList", { uri: directoryUri(PREFIX) }, 393);
+    expect(list.error).toBeUndefined();
+    expect(list.result.entries).toEqual([{ name: "readme.txt", type: "file" }]);
+    const resolve = await rpc(h, "resourceResolve", { uri: directoryUri(PREFIX) }, 394);
+    expect(resolve.result.type).toBe("directory");
+    const target = `${PREFIX}/new-dir`;
+    const mkdir = await rpc(h, "resourceMkdir", { uri: directoryUri(target) }, 395);
+    expect(mkdir.error).toBeUndefined();
+    expect(h.facade.dirs.has(target)).toBe(true);
+    h.stop();
+  });
+
+  it("resourceRead is NOT policy-gated (it stays per-session-confined)", async () => {
+    const h = makeHarness({ pathPolicy: PathPolicy.restricted([PREFIX], identityEnv) });
+    await ready(h);
+    const file = `${OUTSIDE}/f.txt`;
+    h.facade.disk.set(file, "secret");
+    // No session covers this path: the pre-existing per-session
+    // confinement answers first (not the policy message).
+    const res = await rpc(h, "resourceRead", { uri: fileUri(file) }, 396);
+    expect(res.error?.code).toBe(ERROR_PERMISSION_DENIED);
+    expect(res.error?.message).toBe("path is outside every session's working directory");
+    h.stop();
+  });
+});
+
 describe("invokeChangesetOperation", () => {
   const SES = "ses_op";
   const FILE = `${DIR}/mod.txt`;
@@ -3480,6 +3708,27 @@ describe("chat-binding durability", () => {
     expect(h.facade.promptCalls[0]!.sessionID).toBe(peer);
     h.stop();
   });
+
+  it("resurfaces a legacy-channel session under its original channel after a restart", async () => {
+    const h = makeHarness();
+    const original = "copilot:/legacy-dur";
+    seedSession(h, "ses_own_ld", { title: "Legacy", metadata: { "opencode-ahp": { channel: original } } });
+    h.init(1, "c1");
+    await waitInit(h, 1);
+
+    const page = await listSessionsPage(h, 770);
+    // The marker's channel is a non-standard form — it must still be
+    // accepted (a prefix-only check would fall back to the opencode id).
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0].resource).toBe(original);
+
+    // The legacy channel is subscribable with a full snapshot.
+    const sub = await subscribe(h, 1, original, 771);
+    expect(sub.error).toBeUndefined();
+    expect(sub.result.snapshot.resource).toBe(original);
+    expect(sub.result.snapshot.state.chats).toHaveLength(1);
+    h.stop();
+  });
 });
 
 // ── terminals ─────────────
@@ -3783,6 +4032,36 @@ describe("terminals", () => {
         expect(state.cwd, cases[i]!.label).toBe(`file://${cases[i]!.expected}/`);
         h.stop();
       }
+    });
+
+    it("client-claimed terminal opens in a live cross-location session's working directory", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      // A session whose agent has tool access in OTHER (cross-location).
+      const created = await createSession(h, 1, sessionChannelURI("wd-term"), {
+        provider: "gpuz",
+        workingDirectories: [directoryUri(OTHER)],
+      });
+      expect(created.error).toBeUndefined();
+      // VS Code client-claims its pty terminals and opens them in the
+      // session's folder: a cwd inside OTHER must pass the clamp
+      // (previously it clamped to the location directory).
+      const res = await createPtyTerminal(h, "agenthost-terminal://t-wd", {
+        cwd: `${OTHER}/sub`,
+      }, 950);
+      expect(res.error).toBeUndefined();
+      const state = await terminalSnapshotState(h, "agenthost-terminal://t-wd", 951);
+      expect(state.cwd).toBe(directoryUri(`${OTHER}/sub`));
+      // A cwd outside every working root still clamps to the location
+      // directory.
+      const out = await createPtyTerminal(h, "agenthost-terminal://t-wd-out", {
+        cwd: "/etc/ssh",
+      }, 952);
+      expect(out.error).toBeUndefined();
+      const outState = await terminalSnapshotState(h, "agenthost-terminal://t-wd-out", 953);
+      expect(outState.cwd).toBe(`file://${DIR}/`);
+      h.stop();
     });
 
     it("rejects duplicate channels with AHP AlreadyExists (-32010)", async () => {

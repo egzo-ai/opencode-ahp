@@ -6,7 +6,7 @@ import { resolve as resolvePath } from "node:path";
 import { ToolResultContentType, SessionActiveClient, StringOrMarkdown, ToolCallResult, ToolResultContent } from "@microsoft/agent-host-protocol";
 import { FacadeClientToolResult, FacadeModelRef, FacadeToolContent } from "./bridge.js";
 import { normalizeToolDefinitions } from "./client-tools.js";
-import { channelKind } from "./channels.js";
+import { channelKind, isSessionChannel } from "./channels.js";
 import { isRecord } from "./options.js";
 
 /**
@@ -69,7 +69,10 @@ export function parseAhpMarker(metadata: unknown): { chat?: string; owner?: stri
   const owner = marker["owner"];
   if (typeof owner === "string" && owner.startsWith("ses")) out.owner = owner;
   const channel = marker["channel"];
-  if (typeof channel === "string" && channelKind(channel) === "session") out.channel = channel;
+  // isSessionChannel, not channelKind === "session": a session created
+  // on a non-standard (legacy) channel must resurface under the ORIGINAL
+  // channel after a restart, not fall back to the opencode id.
+  if (typeof channel === "string" && isSessionChannel(channel)) out.channel = channel;
   return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -188,5 +191,8 @@ export function mapToolResultContent(content: readonly { type: string; text?: st
 export function isPathInside(child: string, parent: string): boolean {
   const a = resolvePath(child);
   const b = resolvePath(parent);
+  // The root contains every absolute path (the `b + "/"` join would
+  // otherwise compare against `"//"`).
+  if (b === "/") return a === "/" || a.startsWith("/");
   return a === b || a.startsWith(b + "/");
 }

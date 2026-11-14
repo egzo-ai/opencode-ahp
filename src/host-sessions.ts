@@ -7,11 +7,11 @@ import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionType, SessionStatus, ResolveSessionConfigResult, SessionActiveClient, SessionSummary } from "@microsoft/agent-host-protocol";
 import { agentDirectoryCustomization, chatChangesetCatalog, chatSummaryOf, directoryUri, initialSessionState, mapAgentCustomizations, sessionChangesetCatalog, FacadeSession } from "./bridge.js";
-import { ROOT_CHANNEL, channelKind, chatChannelURI, sessionChannelURI, sessionIDOf } from "./channels.js";
+import { ROOT_CHANNEL, chatChannelURI, isSessionChannel, sessionChannelURI, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { createSessionStateStore } from "./state.js";
-import { ERROR_INTERNAL, ERROR_NO_PROVIDER, ERROR_SESSION_EXISTS } from "./host-errors.js";
+import { ERROR_INTERNAL, ERROR_NO_PROVIDER, ERROR_PERMISSION_DENIED, ERROR_SESSION_EXISTS } from "./host-errors.js";
 import { RpcMessage, SessionRecord } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, AHP_METADATA_KEY, parseAhpMarker, errorMessage, firstEnabledModelRef, normalizeActiveClient } from "./host-util.js";
 
@@ -30,6 +30,12 @@ export class HostSessions extends HostChats {
    * location (no multipleWorkingDirectories capability: extras are
    * ignored).
    *
+   * The client-chosen session channel is accepted in the standard
+   * `ahp-session:/<suffix>` form or the non-standard `<scheme>:/<suffix>`
+   * form (VS Code's legacy addressing and the AHP reference client both
+   * send `<provider>:/<uuid>`); it is echoed back verbatim and stays
+   * subscribable through the registry's session-channel set (design §6).
+   *
    * Error codes: -32602 (invalid params, including `workingDirectories`),
    * -32002 (no agent for the requested provider),
    * -32003 (the session URI already exists),
@@ -39,8 +45,31 @@ export class HostSessions extends HostChats {
   protected async handleCreateSession(socketId: number, msg: RpcMessage): Promise<void> {
     const params = isRecord(msg.params) ? msg.params : {};
     const channel = params["channel"];
-    if (typeof channel !== "string" || channelKind(channel) !== "session") {
-      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createSession requires an ahp-session:/… channel");
+    if (typeof channel !== "string" || !isSessionChannel(channel)) {
+      // Log the offending channel — a -32602 here used to go out silently,
+      // which made a client's channel error unattributable on our side.
+      this.log(`createSession rejected: channel is not a session URI: ${JSON.stringify(channel)}`);
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_PARAMS,
+        `createSession requires a session channel (ahp-session:/… or <provider>:/…); got ${JSON.stringify(
+          channel,
+        )}`,
+      );
+      return;
+    }
+    // A channel already taken by a live pty terminal would leave two
+    // resource sets claiming one URI (dispatch resolves it as the
+    // session, the terminal becomes unreachable). Keep the sets disjoint.
+    if (this.channels.hasTerminal(channel)) {
+      this.log(`createSession rejected: channel is a live terminal channel: ${channel}`);
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_PARAMS,
+        `createSession channel ${channel} is already a live terminal channel`,
+      );
       return;
     }
     const suffix = sessionIDOf(channel) as string;
@@ -144,6 +173,27 @@ export class HostSessions extends HostChats {
       sessionDir = dir;
     }
 
+    // The directory allowlist (the `allowedWorkingDirectories` option):
+    // when restricted, the target must resolve under one of the prefixes
+    // (after symlink resolution). A denial is a flat -32009 (the message
+    // is deliberately the same for every denied path — no existence
+    // oracle); the full detail goes to the log.
+    if (sessionDir !== undefined) {
+      const policy = this.opts.pathPolicy;
+      if (policy !== undefined && !(await policy.allows(sessionDir))) {
+        this.log(
+          `createSession: working directory ${sessionDir} is not permitted by host policy (channel: ${channel})`,
+        );
+        this.sendError(
+          socketId,
+          msg.id,
+          ERROR_PERMISSION_DENIED,
+          "working directory is not permitted by host policy",
+        );
+        return;
+      }
+    }
+
     // opencode SessionIDs must start with "ses": pass the suffix through
     // only when it already is one; otherwise let opencode mint an id and
     // record the suffix→id mapping (the record key is the opencode id).
@@ -226,6 +276,10 @@ export class HostSessions extends HostChats {
     // resolve in the registry.
     this.channels.addSession(suffix);
     this.channels.addSession(created.sessionID);
+    // The channel URI itself must stay subscribable — load-bearing for
+    // non-standard (legacy) session channels, which classify "unknown"
+    // by prefix and resolve only through this set.
+    this.channels.addSessionChannel(channel);
     const defaultChat = this.newChatRuntime(rec.defaultChatURI, created.sessionID, "Chat 1", now);
     this.bindChat(rec, defaultChat);
 
@@ -566,6 +620,9 @@ export class HostSessions extends HostChats {
     // suffix too (mirroring `handleCreateSession`).
     const suffix = sessionIDOf(recChannel) as string;
     if (suffix !== fs.sessionID) this.channels.addSession(suffix);
+    // Mirrors `handleCreateSession`: the channel URI stays subscribable
+    // (load-bearing for non-standard legacy channels).
+    this.channels.addSessionChannel(recChannel);
     const defaultChat = this.newChatRuntime(rec.defaultChatURI, fs.sessionID, "Chat 1", modifiedAt);
     this.bindChat(rec, defaultChat);
     sessionStore.apply({ type: ActionType.SessionReady });
@@ -626,6 +683,7 @@ export class HostSessions extends HostChats {
     const id = sessionIDOf(rec.channel);
     if (id !== null) this.channels.removeSession(id);
     this.channels.removeSession(rec.sessionID);
+    this.channels.removeSessionChannel(rec.channel);
     this.publish({
       channel: ROOT_CHANNEL,
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },

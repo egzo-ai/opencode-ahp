@@ -6,6 +6,7 @@ import { ActionType, ReconnectResultType, Implementation, SessionSummary } from 
 import { OpencodeFacade } from "./bridge.js";
 import { ClientToolInvocation } from "./client-tools.js";
 import { ChatStateStore, ChangesetStateStore, SessionStateStore, TerminalStateStore } from "./state.js";
+import type { PathPolicy } from "./path-policy.js";
 
 // ActionType / ReconnectResultType are `declare const enum` in the package
 // but are also real runtime objects (verified against the published dist),
@@ -225,6 +226,14 @@ export interface HostOptions {
    * entry provides the Bun-backed factory; tests inject a fake.
    */
   spawnPty?: SpawnPty;
+  /**
+   * The directory allowlist (the `allowedWorkingDirectories` option,
+   * design §3.3): undefined → unrestricted. When restricted, a
+   * client-named path must resolve under one of the prefixes (after
+   * symlink resolution) — the `createSession.workingDirectories` target
+   * and the unconfined `resource*` commands; a denial is a flat -32009.
+   */
+  pathPolicy?: PathPolicy;
   /** Deliver a JSON-serializable frame to a connection. */
   send: (socketId: number, message: unknown) => void;
   /** Close one connection (a superseded duplicate clientId). */

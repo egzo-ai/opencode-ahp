@@ -83,13 +83,15 @@ export class HostBase {
   }
 
   /**
-   * Channel kind with live-terminal awareness: client-chosen pty terminal
-   * URIs (from `createTerminal`) classify "unknown" by prefix alone —
-   * they classify "terminal" while their record is live.
+   * Channel kind with live-resource awareness: client-chosen pty terminal
+   * URIs (from `createTerminal`) and non-standard (legacy) session
+   * channels (`<scheme>:/<suffix>`) classify "unknown" by prefix alone —
+   * they classify "terminal"/"session" while their record is live.
    */
   protected kindOf(uri: string): ChannelKind {
     const kind = channelKind(uri);
     if (kind !== "unknown") return kind;
+    if (this.channels.hasSessionChannel(uri)) return "session";
     return this.terminals.has(uri) ? "terminal" : kind;
   }
 

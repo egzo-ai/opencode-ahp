@@ -4,6 +4,7 @@ import {
   ROOT_CHANNEL,
   channelKind,
   chatChannelURI,
+  isSessionChannel,
   parseChangesetChannel,
   sessionChannelURI,
   sessionChangesetURI,
@@ -47,6 +48,40 @@ describe("session URI helpers", () => {
     expect(sessionIDOf("ahp-chat:/s-1")).toBe("s-1");
     expect(sessionIDOf(ROOT_CHANNEL)).toBeNull();
     expect(sessionIDOf("bogus://x")).toBeNull();
+  });
+
+  it("accepts the non-standard legacy session form (client legacy addressing)", () => {
+    // VS Code's legacy addressing (and the AHP reference client) create
+    // sessions under <provider>:/<uuid>.
+    expect(isSessionChannel("ahp-session:/s-1")).toBe(true);
+    expect(isSessionChannel("copilot:/d6df6b12-1111-4111-8111-111111111111")).toBe(true);
+    expect(isSessionChannel("agenthost-2:/x")).toBe(true);
+    // Host namespaces never qualify as session channels.
+    expect(isSessionChannel(ROOT_CHANNEL)).toBe(false);
+    expect(isSessionChannel("ahp-chat:/s-1")).toBe(false);
+    expect(isSessionChannel("ahp-terminal:/t-1")).toBe(false);
+    expect(isSessionChannel("ahp-session:/s-1/changeset/session")).toBe(false);
+    // Authority-bearing or empty-path URIs are not the legacy form.
+    expect(isSessionChannel("file:///tmp/x")).toBe(false);
+    expect(isSessionChannel("https://x/y")).toBe(false);
+    expect(isSessionChannel("copilot:/")).toBe(false);
+    expect(isSessionChannel("bogus://x")).toBe(false);
+  });
+
+  it("resolves the suffix of the legacy session form (sessionIDOf)", () => {
+    expect(sessionIDOf("copilot:/s-1")).toBe("s-1");
+    expect(sessionIDOf("copilot:/a/b")).toBe("a/b");
+    expect(sessionIDOf("copilot:")).toBeNull();
+    expect(sessionIDOf("copilot://x")).toBeNull(); // authority, not the legacy form
+    expect(sessionIDOf("file:///tmp/x")).toBeNull();
+  });
+
+  it("parses changeset URIs owned by a legacy session channel", () => {
+    expect(parseChangesetChannel("copilot:/s-1/changeset/session")).toEqual({
+      ownerUri: "copilot:/s-1",
+      sessionID: "s-1",
+      kind: "session",
+    });
   });
 });
 
@@ -210,6 +245,36 @@ describe("ChannelRegistry: live sessions", () => {
     expect(reg.subscribe(2, sessionChannelURI("s-1"))).toEqual({ ok: false, reason: "no-such-session" });
     // socket 1's existing subscription record stays (the host prunes on session events)
     expect(reg.subscriptionsOf(1)).toEqual([sessionChannelURI("s-1")]);
+  });
+});
+
+describe("ChannelRegistry: live session channels (non-standard form)", () => {
+  it("tracks the channel URI set and subscribability", () => {
+    const reg = new ChannelRegistry();
+    const uri = "copilot:/d6df6b12";
+    expect(reg.hasSessionChannel(uri)).toBe(false);
+    // No live record: the URI is unknown (the suffix is not a live
+    // session id, and the form classifies "unknown" by prefix).
+    expect(reg.subscribe(1, uri)).toEqual({ ok: false, reason: "unknown-uri" });
+    reg.addSessionChannel(uri);
+    expect(reg.hasSessionChannel(uri)).toBe(true);
+    expect(reg.subscribe(1, uri)).toEqual({ ok: true });
+    reg.removeSessionChannel(uri);
+    expect(reg.subscribe(2, uri)).toEqual({ ok: false, reason: "unknown-uri" });
+    // Existing subscription records survive the removal (host prunes later).
+    expect(reg.subscriptionsOf(1)).toEqual([uri]);
+  });
+
+  it("keeps the session-channel set disjoint from the terminal set (subscribe accepts either)", () => {
+    const reg = new ChannelRegistry();
+    const uri = "copilot:/s-1";
+    reg.addTerminal(uri); // a client-chosen pty terminal on the same form
+    expect(reg.subscribe(1, uri)).toEqual({ ok: true });
+    reg.removeTerminal(uri);
+    reg.addSessionChannel(uri);
+    expect(reg.subscribe(2, uri)).toEqual({ ok: true });
+    reg.removeSessionChannel(uri);
+    expect(reg.subscribe(3, uri)).toEqual({ ok: false, reason: "unknown-uri" });
   });
 });
 

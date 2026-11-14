@@ -179,6 +179,10 @@ function ensureLocation() {
         "port": 8767,
         "token": ${JSON.stringify(ahpToken)},
         "allowedOrigins": "*",
+        // The directory allowlist under live test (ahp-allowlist.mjs):
+        // the scratch tree (so the rest of /tmp stays a deny surface)
+        // plus /home.
+        "allowedWorkingDirectories": [${JSON.stringify(opts.scratch)}, "/home"],
         "logEvents": true
       }
     }

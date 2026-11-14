@@ -118,6 +118,33 @@ describe("resolveOptions: validation and fallback (no throw)", () => {
     expect(resolveOptions({}, FILE).allowedOrigins).toEqual(["vscode://vscode"]);
   });
 
+  it("allowedWorkingDirectories accepts a string array (empty = unrestricted)", () => {
+    // built-in: unrestricted
+    expect(resolveOptions(undefined, null).allowedWorkingDirectories).toEqual([]);
+    // valid values pass through
+    expect(
+      resolveOptions({ allowedWorkingDirectories: ["/tmp", "/home"] }, null).allowedWorkingDirectories,
+    ).toEqual(["/tmp", "/home"]);
+    expect(resolveOptions({ allowedWorkingDirectories: [] }, null).allowedWorkingDirectories).toEqual([]);
+    // an explicit empty array (a valid value) wins over a file value
+    expect(
+      resolveOptions(
+        { allowedWorkingDirectories: [] },
+        JSON.stringify({ allowedWorkingDirectories: ["/a"] }),
+      ).allowedWorkingDirectories,
+    ).toEqual([]);
+    // invalid shapes fall back (built-in: unrestricted)
+    expect(resolveOptions({ allowedWorkingDirectories: "nope" }, null).allowedWorkingDirectories).toEqual([]);
+    expect(resolveOptions({ allowedWorkingDirectories: [1] }, null).allowedWorkingDirectories).toEqual([]);
+    expect(resolveOptions({ allowedWorkingDirectories: [""] }, null).allowedWorkingDirectories).toEqual([]);
+    expect(
+      resolveOptions(
+        { allowedWorkingDirectories: ["/a"] },
+        JSON.stringify({ allowedWorkingDirectories: "nope" }),
+      ).allowedWorkingDirectories,
+    ).toEqual(["/a"]); // ctx valid value beats an invalid file value
+  });
+
   it("tls requires both keyPath and certPath strings", () => {
     expect(resolveOptions({ tls: { keyPath: "/k", certPath: "/c" } }, null).tls).toEqual({
       keyPath: "/k",

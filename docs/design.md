@@ -124,12 +124,13 @@ flowchart TB
 | `src/transport.ts` | Pure policy functions (loopback check, token extraction/comparison, Origin policy, path routing) plus a thin `Bun.serve` listener implementing the `Listener` interface. Auth happens at the WebSocket **upgrade**. |
 | `src/handshake.ts` | The `initialize` command: validation and semver capability negotiation via the official package's `negotiateProtocolVersion`. |
 | `src/host.ts` | The `Host` class — the JSON-RPC 2.0 router that ties transport, handshake, channels, sequencer, state stores, and the facade together: command handling, client-action dispatch, session/chat records, the opencode event pump, changesets, synthetic terminals, and client-tool routing. |
-| `src/channels.ts` | Channel URI parsing/formatting (`ahp-root://`, `ahp-session:/`, `ahp-chat:/`, `ahp-terminal:/`, `…/changeset/…`) and the `ChannelRegistry` (per-socket subscriptions, live session ids, live terminal URIs). |
+| `src/channels.ts` | Channel URI parsing/formatting (`ahp-root://`, `ahp-session:/`, `ahp-chat:/`, `ahp-terminal:/`, `…/changeset/…`, plus the non-standard legacy session form `<scheme>:/<suffix>` — `isSessionChannel`) and the `ChannelRegistry` (per-socket subscriptions, live session ids, live session-channel URIs, live terminal URIs). |
 | `src/seq.ts` | The `Sequencer`: a single **host-wide** monotonic `serverSeq` (AHP 1.0.0 numbers all channels on one sequence) with a bounded replay window. |
 | `src/state.ts` | Channel state stores. Every store simply applies the **official reducers** from `@microsoft/agent-host-protocol` (`rootReducer`, `sessionReducer`, `chatReducer`, `changesetReducer`, `terminalReducer`) — the host never hand-rolls a state transition. |
 | `src/bridge.ts` | The opencode-aware mapping layer: the `OpencodeFacade` contract, `mapV2Event` (raw v2 event → narrow `FacadeEvent` union), catalog/summary/changeset builders, and the content-ref URI helpers (`file://`, `ahp-content://head/…`, `ahp-content://snap/…`). |
 | `src/client-tools.ts` | Pure helpers for client-provided tools: wire validation of `ToolDefinition`s, the cross-session tool union, and per-session provider lookup. |
 | `src/options.ts` | Option validation + resolution (ctx options ▸ `options.jsonc` sibling ▸ built-ins) and a dependency-free JSONC stripper. |
+| `src/path-policy.ts` | The directory allowlist ([§3.3](#33-directory-allowlist-allowedworkingdirectories)): the pure `PathPolicy` decision (prefix/inside match over the symlink-resolved target) with the filesystem half injected, plus prefix lexical normalization. |
 | `src/error.ts` | `errorMessage` normalizer. |
 | `src/test/*` | Vitest suites for the pure modules (`state.ts` and `error.ts` covered indirectly through the host suites), including a captured-turn fixture replayed through the real AHP reducers. |
 
@@ -144,6 +145,8 @@ lives and dies with its location:
 location boots → setup(ctx)
   1. resolve options; enabled: false → fully inert (no listener)
   2. token: explicit option, else persisted (generated once)
+  2b. directory allowlist (optional): resolve the prefixes
+      (a misconfigured list fails closed — AHP off)
   3. build Host (facade injected) + createListener (TLS material read)
   4. host.startEventPump()
   → logs the listening URL
@@ -162,27 +165,13 @@ mandatory for an indefinitely-loaded AHP location.
 
 ## 3. Transport & security
 
-`transport.ts` runs one `Bun.serve` HTTP+WS server on `host:port`:
+`transport.ts` runs one `Bun.serve` HTTP+WS server on `host:port`.
+
+### 3.1 The listener
 
 - **`path`** (default `/ahp`) — the AHP WebSocket endpoint.
 - **`healthPath`** (default `/healthz`) — plain HTTP `ok`, no auth.
 - Any other path → 404.
-
-**Authentication is at the WebSocket upgrade**, before any socket exists
-(AHP transport spec): a missing or invalid token, or a disallowed Origin,
-gets an HTTP 401/403 and never a connection. The presented token is taken
-from the `?token=` query parameter first, then
-`Authorization: Bearer <token>`, and compared in constant time.
-
-Additional policies:
-
-- **Token always required.** There is no no-token mode. A non-loopback
-  bind additionally **refuses to start** without a token (the listener
-  throws, which takes the [§14](#14-error-handling--graceful-degradation) degrade path).
-- **Origin allowlist** (`allowedOrigins`, default `"*"`): a null Origin
-  (non-browser clients — VS Code's own connection, CLI probes) always
-  passes; a present Origin must be in the list unless `"*"`. This is
-  defense-in-depth only — the token is the credential.
 - **TLS**: with `tls: { keyPath, certPath }`, the entry point reads the
   PEM files and hands their *contents* to `Bun.serve`, giving native
   `wss://` termination on the same port (the port becomes TLS-only; the
@@ -193,6 +182,79 @@ The listener is behind a `Listener` interface (`port`, `sendTo`,
 `closeConnection`, `stop`), so the protocol layer never sees Bun types;
 a `ws`-package fallback could be dropped in if the plugin context ever
 forbids raw listeners.
+
+### 3.2 Authentication
+
+**Authentication is at the WebSocket upgrade**, before any socket exists
+(AHP transport spec): a missing or invalid token, or a disallowed Origin,
+gets an HTTP 401/403 and never a connection. The presented token is taken
+from the `?token=` query parameter first, then
+`Authorization: Bearer <token>`, and compared in constant time.
+
+- **Token always required.** There is no no-token mode. A non-loopback
+  bind additionally **refuses to start** without a token (the listener
+  throws, which takes the [§14](#14-error-handling--graceful-degradation) degrade path).
+- **Origin allowlist** (`allowedOrigins`, default `"*"`): a null Origin
+  (non-browser clients — VS Code's own connection, CLI probes) always
+  passes; a present Origin must be in the list unless `"*"`. This is
+  defense-in-depth only — the token is the credential.
+
+### 3.3 Directory allowlist (`allowedWorkingDirectories`)
+
+An opt-in hardening above token auth: an array of absolute path prefixes
+that bounds which paths a client may name on the host. Absent or empty
+(the default) is unrestricted — the default posture matches the VS Code
+reference agent host, which exposes the whole host filesystem to a
+connected (i.e. authenticated) client.
+
+**What it bounds, and what it does not.** The AHP token is a full client
+credential, so the allowlist is blast-radius scoping / defense-in-depth,
+*not* a sandbox: the agent's `shell` tool is not directory-confined (its
+`cwd` only defaults to the session directory; a command may name any
+absolute path, and the permission confirmation goes back to the same
+token-holder who approves it). What it stops concretely: whole-filesystem
+enumeration and metadata via `resourceList`/`resourceResolve`, arbitrary
+`resourceMkdir`, agent locations rooted outside the intended trees
+(opencode confines the agent's file tools, changeset scope, and terminal
+`cwd` to the location, so scoping the location scopes the agent's file
+access), and a leaked token pointed at other homes or `/etc`. Genuine
+sandboxing (a dedicated OS user, a container) remains an operational
+concern — the [multi-tenant / sandboxing non-goal](futures.md#5-deferred-v1-non-goals)
+stands.
+
+**Semantics.** A client-named path is permitted when its
+symlink-resolved form is a prefix of, or strictly inside, one of the
+prefixes. The prefixes are lexically normalized at setup and, when they
+exist, realpath'd (a symlink prefix covers its target); prefixes that do
+not exist yet stay lexical (a `resourceMkdir` may create one). The target
+is resolved the same way: the existing prefix portion is canonicalized
+(walk up to the deepest existing ancestor, realpath, re-append the
+missing tail), so a symlink planted under an allowed prefix
+(`/tmp/link → /etc`) resolves outside the list and is denied.
+When the resolved form cannot be determined (the resolution throws —
+e.g. EACCES on an existing ancestor) the decision defers: the policy
+allows, and the underlying operation's own errno error is what the client
+sees — fail-closed only on a positive determination.
+
+**Misconfiguration fails closed.** A non-absolute entry, or an
+existing-but-undecidable prefix (realpath throws non-ENOENT), is a
+configuration error: the entry point logs and takes the [§14](#14-error-handling--graceful-degradation)
+degrade path (AHP off, opencode keeps serving) — never silent-unrestricted.
+
+**Gated surfaces.** `createSession`'s `workingDirectories` first entry
+(when present — a session without it runs in the plugin's own location,
+which is not gated) and the three unconfined `resource*` commands
+([§6](#6-command-surface)). Not gated: `resourceRead` (already
+per-session-confined to the location directory and the live sessions' own
+working directories), `createTerminal` (its `cwd` clamps into the
+location directory or a live session's own working directory — itself
+allowlist-gated at session creation — so it is transitively gated), and
+the plugin's
+own location. A denial answers `-32009` (AHP PermissionDenied) with a
+flat message identical for every denied path — no existence oracle —
+`path is not permitted by host policy` (resource commands) /
+`working directory is not permitted by host policy` (`createSession`);
+the full detail goes to the server log.
 
 ## 4. Connection model & handshake
 
@@ -258,7 +320,7 @@ eviction is safe.
 | Kind | URI shape | Notes |
 | --- | --- | --- |
 | root | `ahp-root://` | One per host. Catalog of agents, active-session count, terminal list, session add/remove/summary notifications. |
-| session | `ahp-session:/<suffix>` | One per AHP session. The suffix is opaque and client-chosen; opencode session ids (`ses…`) double as suffixes for externally created sessions. Suffixes containing `/changeset/` are rejected (they would collide with changeset URIs). |
+| session | `ahp-session:/<suffix>`, or a non-standard `<scheme>:/<suffix>` (client legacy addressing — [§6](#6-command-surface)) | One per AHP session. The suffix is opaque and client-chosen; opencode session ids (`ses…`) double as suffixes for externally created sessions. Suffixes containing `/changeset/` are rejected (they would collide with changeset URIs). A legacy-form channel is echoed back verbatim and stays subscribable through the registry's live session-channel set. |
 | chat | `ahp-chat:/<suffix>` | One per chat. The default chat reuses the session's opencode id as its suffix (zero wire change for single-chat clients); peer chats carry client-chosen suffixes. |
 | changeset | `<owner>/changeset/uncommitted` · `<owner>/changeset/session` · `<owner>/changeset/turn/<turnId>` | Owner is a session channel (session kind) or a chat channel (uncommitted, turn kinds). See [§11](#11-changesets). |
 | terminal | `ahp-terminal:/<toolCallId>` | Synthetic: one per foreground `shell`-tool call. Suffix is the opencode tool-call id (globally unique per invocation). See [§12](#12-terminals). |
@@ -266,10 +328,15 @@ eviction is safe.
 
 The `ChannelRegistry` tracks which sockets are subscribed to which
 channel (broadcast targets), the set of live session ids (a session/chat
-channel is subscribable only while its session is registered), and the
-set of live terminal URIs — synthetic `ahp-terminal:` channels **and**
-client-chosen pty channels (the host adds/removes them in step with the
-record map, so a disposed pty URI is unsubscribable again).
+channel is subscribable only while its session is registered), the set
+of live session-channel URIs (the non-standard legacy form classifies
+"unknown" by prefix and resolves only through this set), and the set of
+live terminal URIs — synthetic `ahp-terminal:` channels **and**
+client-chosen pty channels. The host adds/removes the session-channel
+and terminal sets in step with their record maps and keeps them
+disjoint (a live session channel cannot become a pty terminal, and
+vice versa — the two resource types share the `<scheme>:/` URI shape),
+so a torn-down URI is unsubscribable again.
 
 ### 5.2 Sequencer & replay
 
@@ -327,25 +394,28 @@ Requests (methods with an `id`) routed by the host:
 | `dispatchAction` | Notification. See [§9](#9-client-dispatchable-actions). |
 | `listSessions` | All opencode sessions, most-recently-modified first, in-memory cursor pagination (`limit` default 100, `cursor` = offset). Unknown sessions are **lazily registered** (idempotent per opencode id) so their channels become subscribable. |
 | `resolveSessionConfig` | An honest empty schema (`{ type: "object", properties: {} }`, `values: {}`) — opencode collects no session-creation configuration; agent/model choice rides session customizations and the per-turn message. `provider`/`workingDirectory`/`config` params are accepted and ignored. VS Code calls this strictly before the first send of a new session, so an unimplemented host makes every fresh session unstartable. |
-| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (malformed `workingDirectories` or `activeClient`), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
-| `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI; publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
+| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The client-chosen `channel` is accepted in the standard `ahp-session:/<suffix>` form or the non-standard `<scheme>:/<suffix>` form — client legacy addressing: VS Code mints `<provider>:/<uuid>` when its `initialize` result is not yet available at draft-creation time (its `isNativeAgentHost`/`vscode.ahpSessionUris` capability checks never fire without one, and we send no `_meta` to influence them), and the AHP reference client creates sessions the same way (verified 2026-11-13) — and is echoed back verbatim; the channel stays subscribable through the registry's live session-channel set. A channel that is a live pty terminal channel is refused (the two resource sets must stay disjoint). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (a channel that is not a session URI — rejected channels are logged with the offending value — or a live terminal channel; malformed `workingDirectories` or `activeClient`), `-32009` (`workingDirectories` target outside the [`allowedWorkingDirectories` allowlist](#33-directory-allowlist-allowedworkingdirectories), before any backend work), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
+| `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI (the owner must be a session channel under the `createSession` rule — standard or legacy form); publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
 | `disposeChat` | `null`. Removes a peer chat (never the default chat) and its opencode backend session; publishes `session/chatRemoved`. AHP-side unbind happens *before* the backend removal so the racing `session.deleted` event doesn't double-publish. |
 | `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory or one of the live sessions' own working directories), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside every session's working directory. |
 | `resourceResolve` | Metadata for one filesystem `file://` URI: canonical URI (directories end in `/`), `type` (`file` / `directory` / `symlink`), `size`, ISO `mtime`/`ctime`, and a weak etag `W/"<size>-<mtimeMs>"`. `followSymlinks` defaults to true (realpath + stat); `false` lstats the path itself (a link reports as `symlink`). This is the existence check VS Code's remote folder picker runs before accepting a path. Errors: `-32008` not found, `-32009` permission denied, `-32602` not a file URI, `-32603` other. |
 | `resourceList` | Immediate entries of a directory `file://` URI as `{ name, type: file \| directory }` — directories first, then by name. Symlinks are followed for the type (a link to a directory lists as a directory; a dangling link as a file). The target must exist and be a directory: errors `-32008` (missing), `-32602` (not a directory), `-32009` (inaccessible). This is what the folder picker navigates with. |
 | `resourceMkdir` | Creates a directory with `mkdir -p` semantics (parents as needed; an existing directory is a no-op success); result `{}`. Errors: `-32010` the path exists as a non-directory, `-32009` permission denied, `-32602` not a file URI, `-32603` other. |
 | `invokeChangesetOperation` | The only operation the host offers is `discard-changes` (resource-scoped), on a live changeset; it targets the changeset's owning session's directory. See [§11.4](#114-discard-changes). |
-| `createTerminal` | `null`. Spawns an interactive pty shell (`spawnPty` seam — Bun in production) in the resolved working directory and registers the client-chosen channel. Params: `channel` (client-chosen; the host namespace, including the reserved `ahp-terminal:` prefix, is refused), `claim` (a client claim for the dispatching client, or a session claim), `name?`, `cwd?`, `cols?`/`rows?` (defaults 80×24). The `cwd` accepts plain `file://` (what VS Code sends), the client's `vscode-agent-host:`/`agent-host:` wrapper, or a bare absolute path; anything malformed or outside the location directory clamps to the location directory. Errors: `-32601` (capability off, or the runtime cannot spawn ptys), `-32600` (host-namespace channel), `-32010` (AHP AlreadyExists — duplicate channel), `-32602` (malformed params), `-32603` (the spawn threw — logged, R2: the host survives). |
+| `createTerminal` | `null`. Spawns an interactive pty shell (`spawnPty` seam — Bun in production) in the resolved working directory and registers the client-chosen channel. Params: `channel` (client-chosen; the host namespace — including the reserved `ahp-terminal:` prefix — and live session channels are refused, keeping the session and terminal resource sets disjoint), `claim` (a client claim for the dispatching client, or a session claim), `name?`, `cwd?`, `cols?`/`rows?` (defaults 80×24). The `cwd` accepts plain `file://` (what VS Code sends), the client's `vscode-agent-host:`/`agent-host:` wrapper, or a bare absolute path; anything malformed, and anything outside the confinement boundary (the claimed session's working directory, else — for a client-claimed terminal — the location directory or a live session's own directory containing the cwd; [§12.2](#122-pty-terminals-interactive-shells)), clamps to it. Errors: `-32601` (capability off, or the runtime cannot spawn ptys), `-32600` (host-namespace or live session-channel URI), `-32010` (AHP AlreadyExists — duplicate channel), `-32602` (malformed params), `-32603` (the spawn threw — logged, R2: the host survives). |
 | `disposeTerminal` | `null`. Kills the pty (a still-running process gets a final `terminal/exited`), drops the record, and refreshes the catalog. Idempotent: an unknown channel answers `null` (VS Code's shutdown path disposes terminals that may already be gone). Synthetic (session-owned) terminals are host-managed: `-32009` (AHP PermissionDenied). Capability off: `-32601`; missing channel: `-32602`. |
 | `setClientManagedSettingsPermissions` | Accepted and logged as a no-op — a VS Code-specific post-init notification with no AHP 1.0.0 counterpart; the connection must stay up. |
 | anything else | `-32601` for requests; unknown notifications are logged and dropped. |
 
 The filesystem `resource*` commands (`resourceRead`, `resourceResolve`,
 `resourceList`, `resourceMkdir`) are **not** location-confined: the AHP
-surface is token-authenticated, and the client may name any path it can
-resolve — matching the VS Code reference agent host, which exposes the
-whole host filesystem to a connected (i.e. authenticated) client.
-Confinement applies to *session-scoped* surfaces instead: `resourceRead`
+surface is token-authenticated, and by default the client may name any
+path it can resolve — matching the VS Code reference agent host, which
+exposes the whole host filesystem to a connected (i.e. authenticated)
+client. The optional `allowedWorkingDirectories` option
+([§3.3](#33-directory-allowlist-allowedworkingdirectories)) scopes these
+commands (and `createSession.workingDirectories`) to an allowlist of
+path prefixes. Confinement applies to *session-scoped* surfaces instead: `resourceRead`
 `file://` targets, HEAD content refs, changeset diffs, turn-snapshot
 paths, and terminal `cwd` all stay inside the location directory or the
 owning session's own working directory ([§7.3](#73-workspace-workingdirectories)).
@@ -437,7 +507,10 @@ first entry must be a non-empty absolute `file://` URI — a trailing
 slash, which RFC 8089 directory URIs may carry, is stripped, and a
 non-array or empty list, an empty entry, a non-file URI, or a relative
 path is `-32602`. Only the first entry is honored (extras are logged and
-ignored); the backend session is created with
+ignored). When the `allowedWorkingDirectories` allowlist is active
+([§3.3](#33-directory-allowlist-allowedworkingdirectories)), a target
+outside the prefixes answers `-32009` before any backend work. The
+backend session is created with
 `location: { directory }`, which makes opencode boot that directory's
 location on first use — a directory that does not exist fails there, and
 the createSession call answers `-32603` with the boot error. Sessions
@@ -907,12 +980,17 @@ session opens an interactive terminal; a host that refuses
   Code sends — it unwraps its own wrapper before the wire), the client's
   `vscode-agent-host:`/`agent-host:` wrapper (URI path, with the `_ah`
   urlsafe-base64 meta path winning when present), or a bare absolute
-  path. The confinement boundary is the session's own working directory
-  when the claim names a session that has one (a cross-location
-  session's terminal opens there, not in the plugin's location) and the
-  location directory otherwise. Anything malformed, and anything outside
-  the boundary, clamps to the boundary: the shell is a tool of the
-  session's agent and must not spawn outside its working root.
+  path. The confinement boundary is the claimed session's own working
+  directory when the claim names a session that has one (a cross-location
+  session's terminal opens there, not in the plugin's location). A
+  client-claimed terminal — VS Code client-claims its pty terminals while
+  opening them in the session's folder — may open in the location
+  directory or in any live session's own working directory (the same
+  confinement set as `resourceRead` file targets), and the boundary is
+  the innermost of those directories that contains the requested cwd.
+  Anything malformed, and anything outside the boundary, clamps to it:
+  the shell is a tool of the session's agent and must not spawn outside
+  its working roots.
 - **State & lifecycle.** The seed has `isPty: true`, the (resolved)
   directory `cwd`, the requested `cols`/`rows` (default 80×24), the
   requested `name` (default "Shell"), the creating client's claim, and a
@@ -1106,7 +1184,11 @@ read-merge):
 | `{ channel: <session channel URI> }` | the default backend of a minted-id session | resurface the standalone session under the **original client-chosen channel** after a restart (a `ses…` suffix *is* the opencode id and needs no marker). |
 
 Markers are defensive on read: a malformed shape means "no marker"
-(standalone registration under the opencode id). Forked sessions inherit
+(standalone registration under the opencode id). The `channel` marker is
+read with the same `isSessionChannel` rule as `createSession` — both
+the standard and the legacy `<scheme>:/<suffix>` form resurface the
+session under its original channel (a prefix-only check would fall back
+to the opencode id). Forked sessions inherit
 metadata from their parent — when an inherited marker's target is
 already bound, the marker is ignored and the session registers
 standalone (logged).

@@ -5,6 +5,10 @@
  *
  * Channel kinds: root, session, chat, changeset
  * (`<owner>/changeset/{uncommitted|session|turn/<turnId>}`), and terminal.
+ * Sessions may also live on a non-standard `<scheme>:/<suffix>` channel
+ * (client legacy addressing — `isSessionChannel`); such URIs classify
+ * "unknown" by prefix and are tracked in the registry's live
+ * session-channel set instead.
  */
 
 export const ROOT_CHANNEL = "ahp-root://";
@@ -12,6 +16,16 @@ const SESSION_PREFIX = "ahp-session:/";
 const CHAT_PREFIX = "ahp-chat:/";
 const CHANGASET_MARKER = "/changeset/";
 const TERMINAL_PREFIX = "ahp-terminal:/";
+/**
+ * The non-standard session-channel form real clients send: `<scheme>:/
+ * <suffix>` — a scheme token, a single slash (empty authority), a
+ * non-empty suffix. VS Code's legacy addressing (hosts predating the
+ * `vscode.ahpSessionUris` capability) and the AHP Swift reference client
+ * both create sessions under `<provider>:/<uuid>`. The spec's
+ * client-chosen URI is exemplified, not mandated — the host accepts this
+ * form and echoes the channel back verbatim (design §6).
+ */
+const LEGACY_SESSION_RE = /^([a-z][a-z0-9+.-]*):\/([^/].*)$/i;
 
 export type ChannelKind = "root" | "session" | "chat" | "changeset" | "terminal" | "unknown";
 
@@ -56,11 +70,29 @@ export function terminalChannelURI(toolCallId: string): string {
   return TERMINAL_PREFIX + toolCallId;
 }
 
+/**
+ * Whether `uri` is a session channel in a form the host accepts: the
+ * standard `ahp-session:/<suffix>`, or the non-standard
+ * `<scheme>:/<suffix>` form clients use for legacy addressing
+ * (design §6). Chat, root, terminal, and changeset URIs never qualify.
+ */
+export function isSessionChannel(uri: string): boolean {
+  const kind = channelKind(uri);
+  if (kind !== "unknown") return kind === "session";
+  return LEGACY_SESSION_RE.test(uri);
+}
+
 /** The session id behind a session/chat channel URI, or null. */
 export function sessionIDOf(uri: string): string | null {
   const kind = channelKind(uri);
   if (kind === "session") return uri.slice(SESSION_PREFIX.length);
   if (kind === "chat") return uri.slice(CHAT_PREFIX.length);
+  // The legacy session form (<scheme>:/<suffix>, see isSessionChannel):
+  // the suffix is everything after the first ":/".
+  if (kind === "unknown") {
+    const m = LEGACY_SESSION_RE.exec(uri);
+    if (m !== null) return m[2] ?? null;
+  }
   return null;
 }
 
@@ -136,24 +168,31 @@ export interface SubscribeOutcome {
 
 /**
  * Subscription bookkeeping keyed by transport socket id, plus the set of
- * live session ids and the set of live terminal channel URIs (the host
- * adds/removes them as terminals are opened and torn down — synthetic
- * `ahp-terminal:` channels AND client-chosen pty terminal channels from
- * `createTerminal`, whose URIs classify "unknown" by prefix alone).
+ * live session ids, the set of live session CHANNEL URIs (the host
+ * adds/removes them in step with the session records — needed for
+ * non-standard `<scheme>:/<suffix>` session channels, which classify
+ * "unknown" by prefix alone), and the set of live terminal channel URIs
+ * (synthetic `ahp-terminal:` channels AND client-chosen pty terminal
+ * channels from `createTerminal`, whose URIs classify "unknown" by
+ * prefix alone).
  */
 export class ChannelRegistry {
   private readonly subs = new Map<number, Set<string>>();
   private readonly sessions = new Set<string>();
+  private readonly sessionChannels = new Set<string>();
   private readonly terminals = new Set<string>();
 
   /** Subscribe a socket to a channel; fails for unknown URIs, dead sessions, or gone terminals. */
   subscribe(socketId: number, uri: string): SubscribeOutcome {
     const kind = channelKind(uri);
     if (kind === "unknown") {
-      // A client-chosen terminal URI (a live pty terminal) classifies
-      // "unknown" by prefix; it is subscribable while the host keeps it
-      // in the live-terminal set (in step with the record map).
-      if (!this.terminals.has(uri)) return { ok: false, reason: "unknown-uri" };
+      // A non-standard (legacy) session channel or a client-chosen
+      // terminal URI (a live pty terminal) classifies "unknown" by
+      // prefix; each is subscribable while the host keeps it in its
+      // live set (in step with the record maps).
+      if (!this.sessionChannels.has(uri) && !this.terminals.has(uri)) {
+        return { ok: false, reason: "unknown-uri" };
+      }
     } else if (kind !== "root") {
       let id: string | null;
       if (kind === "changeset") {
@@ -210,6 +249,20 @@ export class ChannelRegistry {
 
   hasSession(sessionID: string): boolean {
     return this.sessions.has(sessionID);
+  }
+
+  // ── live session channel URIs (non-standard forms) ────────────────────
+
+  addSessionChannel(uri: string): void {
+    this.sessionChannels.add(uri);
+  }
+
+  removeSessionChannel(uri: string): void {
+    this.sessionChannels.delete(uri);
+  }
+
+  hasSessionChannel(uri: string): boolean {
+    return this.sessionChannels.has(uri);
   }
 
   // ── live terminals (synthetic channels + client-chosen pty channels) ──

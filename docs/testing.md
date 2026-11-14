@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Eight suites, 312 tests as of 2026-11-13, a few
+(`vitest.config.ts`). Nine suites, 341 tests as of 2026-11-13, a few
 seconds wall time:
 
 ```sh
@@ -49,10 +49,11 @@ so assertions observe exactly what the unit under test used.
 | `transport.test.ts` | `isLoopback`, token extraction (query / header), token validity, Origin policy, path routing (`/ahp` vs `/healthz` vs 404), listener creation — including refusing a non-loopback bind without a token. |
 | `handshake.test.ts` | `handleInitialize`: parameter validation, version negotiation (delegated to the pinned package — see [§5.3](#53-what-it-covers-for-this-host)), result shape. |
 | `seq.test.ts` | the global `Sequencer`: monotonic seq, snapshot `fromSeq`, replay window (within → replay, evicted → snapshot). |
-| `channels.test.ts` | channel kind + session/changeset URI helpers; `ChannelRegistry`: snapshot on subscribe, broadcast targets and sockets, live sessions. |
+| `channels.test.ts` | channel kind + session/changeset URI helpers, the non-standard legacy session form (`isSessionChannel` acceptance, the lenient `sessionIDOf`, changeset URIs owned by a legacy channel); `ChannelRegistry`: snapshot on subscribe, broadcast targets and sockets, live sessions, the live session-channel set (subscribability and its disjointness from the terminal set). |
 | `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); `mapV2EventRaw` classification (ok / dropped-with-reason / unimplemented / malformed envelopes) + the `eventLogLine`/`timeStamp` capture-line format; catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
-| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions` (including `workingDirectories` — first-entry honoring, the trailing-slash strip, malformed-URI rejection), the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture, cross-location: subscribe and before-capture diff the session's own directory, relative tool paths resolve against it), the `resource*` family (`resourceRead` — location- or session-dir confined — plus `resourceResolve`/`resourceList`/`resourceMkdir` with the errno → AHP-code mapping, symlink follow semantics, and the not-a-file-URI rejection), `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability (peer-chat backends location-aware), terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam, cwd resolution and clamping), `resolveSessionConfig`. |
+| `path-policy.test.ts` | the directory allowlist (the `allowedWorkingDirectories` option, design.md §3.3): `PathPolicy` prefix/inside decisions over the symlink-resolved form (prefix match, inside, sibling/prefix-overlap denial, the root prefix), symlink escape vs staying inside, the undecidable-resolution deferral (the underlying operation runs), and `normalizeDirPrefix` (dot segments, trailing slash, leading `//` collapse, the relative-path configuration error). |
+| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions` (including `workingDirectories` — first-entry honoring, the trailing-slash strip, malformed-URI rejection), the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture, cross-location: subscribe and before-capture diff the session's own directory, relative tool paths resolve against it), the `resource*` family (`resourceRead` — location- or session-dir confined — plus `resourceResolve`/`resourceList`/`resourceMkdir` with the errno → AHP-code mapping, symlink follow semantics, and the not-a-file-URI rejection), `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, non-standard (legacy) session channels (`createSession` acceptance of the `<provider>:/<uuid>` form with verbatim echo, snapshot/subscribe, `createChat` ownership, the -32602 rejection with log capture, and the session/terminal channel-set disjointness), multi-chat + chat-binding durability (peer-chat backends location-aware, restart resurfacing under the original channel — standard and legacy form), terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam, cwd resolution and clamping — a client-claimed terminal opens in a live cross-location session's working directory, and a cwd outside every working root clamps to the location directory), `resolveSessionConfig`, and the directory allowlist (`allowedWorkingDirectories` — a restricted policy gates `createSession.workingDirectories` and the unconfined `resource*` commands with a flat -32009 before any backend effect, defers on undecidable resolution, and leaves `resourceRead`'s per-session confinement in charge). |
 
 **Fixtures.** `src/test/fixtures/events.jsonl` holds a captured
 `V2EventEncoded` stream (one event per line, arrival order) that
@@ -105,9 +106,12 @@ on a fresh scratch tree, never copying previous state — scaffolds the
 location project `/tmp/ahp-server/test-project` (a
 `.opencode/opencode.jsonc` pinning this checkout as a dev plugin with
 `host: 0.0.0.0`, `port: 8767`, a `token` (generated per fresh tree, or
-pinned with `--token`), `allowedOrigins: "*"`, event capture on
-(`logEvents: true` — design.md [§8.1](design.md#81-event-capture-logevents)),
-and `experimental.location_idle_timeout: false` (the test location must
+pinned with `--token`), `allowedOrigins: "*"`, the directory allowlist
+(`allowedWorkingDirectories: [<scratch>, "/home"]` — the scratch tree
+narrowed so the rest of /tmp stays a deny surface for
+`ahp-allowlist.mjs`), event capture on (`logEvents: true` — design.md
+[§8.1](design.md#81-event-capture-logevents)), and
+`experimental.location_idle_timeout: false` (the test location must
 not idle-evict — design.md
 [§15.3](design.md#153-location-idle-timeout)), plus a `.gitignore`,
 `git init`, and an initial commit of the scaffold so the working tree
@@ -206,12 +210,13 @@ host`.
 | Script | What it verifies |
 | --- | --- |
 | `scripts/ahp-client.mjs` | The hello-world lifecycle: `initialize` (root subscription) → subscribe → ping, printing every response. `--probe` mode instead exercises the transport's HTTP matrix without a WebSocket handshake: healthz, token auth (401), Origin policy (403), routing (404), and the 101 upgrade. |
-| `scripts/ahp-turn-lifecycle.mjs` | The full AHP 1.0.0 surface the Agents window needs: `initialize` → `createSession` (provider selection) → session subscribe (asserts the agent picker is present in the snapshot) → chat subscribe → `dispatchAction chat/turnStarted` → the observed turn lifecycle (echo → `responsePart`/deltas → `turnComplete`). |
+| `scripts/ahp-turn-lifecycle.mjs` | The full AHP 1.0.0 surface the Agents window needs: `initialize` → `createSession` (provider selection) → session subscribe (asserts the agent picker is present in the snapshot) → chat subscribe → `dispatchAction chat/turnStarted` → the observed turn lifecycle (echo → `responsePart`/deltas → `turnComplete`). The session channel is configurable (`--channel`), so the non-standard legacy form (`<provider>:/<uuid>`) is verifiable too. |
 | `scripts/ahp-changesets.mjs` | Changesets end to end: catalogues (session + chat), a file-editing turn surfacing the file in the uncommitted changeset, the turn changeset with snap content refs, `resourceRead` (`file://`, `ahp-content://head`, snap before/after, plus the -32009/-32008 error cases), `filesReviewChanged`, and `discard-changes` through `invokeChangesetOperation`. |
 | `scripts/ahp-client-tools.mjs` | Client-provided tools through the real opencode tool registry: a `ping` tool registered via `createSession.activeClient.tools`, then three turns — happy path (client-executed contributor, single `toolCallComplete`, result in the snapshot), failed result (the model sees the error; the turn still completes), and `requiresResultConfirmation` (the call parks in `pending-result-confirmation`; approving via `chat/toolCallResultConfirmed` releases the held result). |
 | `scripts/ahp-multi-chat.mjs` | Multi-chat: the `multipleChats` capability in the root catalog, `createChat` minting a fresh opencode backend on a client-chosen URI, independent turns on both chats, the `listSessions` differential (peer backends never resurface as sessions), and reload durability with `--leave-peer` / `--recheck` across a location reload. |
 | `scripts/ahp-terminal-probe.mjs` | The pty terminal surface: `initialize` → `createTerminal` (a real shell pty on a client-chosen channel) → the root catalog row → the subscribe snapshot (`isPty`, title, size, directory cwd) → `terminal/input` (a marker command, expecting its output line back through `terminal/data` — the stream is stripped of ANSI/OSC/CSI prompt machinery first) → `terminal/resized` (state tracks it) → `disposeTerminal` (final `terminal/exited`, catalog row drops). |
 | `scripts/ahp-working-dirs.mjs` | Working directories (cross-location sessions) end to end — the surface VS Code's "add projects" drives: the `resource*` commands the folder picker uses (`resourceMkdir` creating the target itself, `resourceResolve` file/directory/symlink metadata + the not-found and non-file-URI errors, a permission probe skipped as root, `resourceList` exact sorted entries + the not-a-directory error), `createSession.workingDirectories` (trailing-slash strip, the `sessionAdded` summary + session-state `workingDirectories` + directory customization, `listSessions`, malformed-URI rejection), changeset confinement to the target's own git repo (the pre-turn before-ref is the **target's** HEAD — the decisive cross-location assertion —, `resourceRead` confined to the session's directory, the before-snapshot content), and the terminal session claim (an out-of-bounds cwd clamped to the session's own directory, verified with `pwd` through the pty stream). The target is script-owned scratch: it is removed and recreated on every run. |
+| `scripts/ahp-allowlist.mjs` | The directory allowlist (`allowedWorkingDirectories`) end to end (design.md §3.3) — the test server's scaffolded config pins the allowlist to `[<scratch>, "/home"]`: the positive controls (listing and `resourceMkdir` under the scratch prefix, `createSession` under a prefix with the `sessionAdded` summary carrying the target, and a session without `workingDirectories` still running in the plugin's own location), the flat -32009 for every gated surface outside the prefixes (`resourceList` /etc, `resourceResolve` /etc/hostname, `resourceList` the scratch prefix's own parent /tmp, and `createSession` for both an existing and a missing target — the same message throughout, no existence oracle), and the symlink semantics (a link under a prefix pointing outside is denied because the resolved form is checked; a link that stays inside passes). The probe tree and symlinks are script-owned scratch: removed at the start of every run. |
 | `scripts/capture-events.mjs` | Offline fixture capture (no AHP involved): boots a scratch location, opens the server's SSE event stream, runs one small tool-using prompt, and records every V2Event envelope to `src/test/fixtures/events.jsonl` for the unit suites ([§1](#1-unit-tests-vitest)). |
 
 Usage (the token is the one from the project config):
@@ -231,6 +236,7 @@ node scripts/ahp-terminal-probe.mjs --token "$TOKEN" --base http://127.0.0.1:876
   --project-dir /tmp/ahp-server/test-project
 node scripts/ahp-working-dirs.mjs --token "$TOKEN" --base http://127.0.0.1:8767 \
   --target-dir /tmp/ahp-server/wd-probe
+node scripts/ahp-allowlist.mjs --token "$TOKEN" --base http://127.0.0.1:8767
 ```
 
 (`ahp-changesets.mjs` also ensures its git fixture — the `notes.txt`

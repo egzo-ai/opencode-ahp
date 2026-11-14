@@ -5,7 +5,7 @@
 import { HostClientTools } from "./host-client-tools.js";
 import { ActionType, Message } from "@microsoft/agent-host-protocol";
 import { agentIDFromUri, chatChangesetCatalog, chatSummaryOf, initialChatState } from "./bridge.js";
-import { channelKind, sessionIDOf } from "./channels.js";
+import { channelKind, isSessionChannel, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { createChatStateStore } from "./state.js";
@@ -109,8 +109,13 @@ export class HostChats extends HostClientTools {
     const params = isRecord(msg.params) ? msg.params : {};
     const channel = params["channel"];
     const chatURI = params["chat"];
-    if (typeof channel !== "string" || channelKind(channel) !== "session") {
-      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat requires an ahp-session:/… channel");
+    if (typeof channel !== "string" || !isSessionChannel(channel)) {
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_PARAMS,
+        "createChat requires a session channel (ahp-session:/… or <provider>:/…)",
+      );
       return;
     }
     const rec = this.byChannel.get(channel);

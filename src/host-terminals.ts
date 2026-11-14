@@ -165,13 +165,25 @@ export class HostTerminals extends HostResources {
     }
     // The channel must be client-chosen: anything that classifies as a
     // host channel (ahp-root/session/chat/changeset/terminal) is refused —
-    // including the reserved `ahp-terminal:` synthetic prefix.
+    // including the reserved `ahp-terminal:` synthetic prefix. A
+    // non-standard (legacy) session channel classifies "unknown" by
+    // prefix but is refused while live — the two resource sets must stay
+    // disjoint (dispatch resolves such URIs as sessions).
     if (channelKind(channel) !== "unknown") {
       this.sendError(
         socketId,
         msg.id,
         ERROR_INVALID_REQUEST,
         `createTerminal channel ${channel} must not use the host channel namespace`,
+      );
+      return;
+    }
+    if (this.channels.hasSessionChannel(channel)) {
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_REQUEST,
+        `createTerminal channel ${channel} is already a live session channel`,
       );
       return;
     }
@@ -196,8 +208,10 @@ export class HostTerminals extends HostResources {
       return;
     }
     // A session claim scopes the cwd to that session's own working
-    // directory (a cross-location session's terminal opens there, not in
-    // the plugin's location); a client claim falls back to the location.
+    // directory; a client claim (VS Code client-claims its pty terminals
+    // while opening them in the session's folder) may open in the
+    // location directory or in any live session's own working directory
+    // (see resolveTerminalCwd).
     const sessionDir =
       claim.kind === TerminalClaimKind.Session ? this.byChannel.get(claim.session)?.directory : undefined;
     const cwd = this.resolveTerminalCwd(typeof params["cwd"] === "string" ? params["cwd"] : undefined, sessionDir);
@@ -289,22 +303,24 @@ export class HostTerminals extends HostResources {
 
   /**
    * Resolve a `createTerminal` cwd to an absolute path inside the
-   * session's working directory (a claimed terminal is scoped to its
-   * session; a client-claimed one to the location directory). Accepted:
-   * a plain `file://` URI (what the VS Code client sends — it unwraps
-   * its own wrapper before the wire), the client's
+   * terminal's confinement boundary. A session-claimed terminal is
+   * scoped to its session's own working directory. A client-claimed
+   * terminal (VS Code client-claims its pty terminals but opens them in
+   * the session's folder) may open in the location directory or in any
+   * live session's own working directory — the same confinement as
+   * `resourceRead` file targets (`containingSessionDir`). Accepted: a
+   * plain `file://` URI (what the VS Code client sends — it unwraps its
+   * own wrapper before the wire), the client's
    * `vscode-agent-host:`/`agent-host:` wrapper (supported for
    * robustness), and a bare absolute path. Anything malformed — and
-   * anything outside that boundary — falls back to it: the shell is a
-   * tool of the session's agent and must not be spawned outside its
-   * working root.
+   * anything outside the boundary — falls back to the boundary: the
+   * shell is a tool of the session's agent and must not be spawned
+   * outside its working roots.
    */
   protected resolveTerminalCwd(raw: string | undefined, sessionDir?: string): string {
-    // The clamp boundary (and the fallback when no cwd is given) is the
-    // session's own working directory — the location directory for legacy
-    // sessions or a client-claimed terminal.
-    const boundary = sessionDir ?? this.opts.defaultDirectory;
-    const fallback = boundary ?? process.cwd();
+    // The fallback when no usable cwd is given: the claimed session's
+    // working directory, else the location directory.
+    const fallback = sessionDir ?? this.opts.defaultDirectory ?? process.cwd();
     if (raw === undefined || raw.length === 0) return fallback;
     let path: string | null = null;
     if (raw.startsWith("file://")) {
@@ -322,6 +338,12 @@ export class HostTerminals extends HostResources {
       this.log(`terminal cwd ${raw} is not a usable path; falling back to ${fallback}`);
       return fallback;
     }
+    // The clamp boundary: the claimed session's working directory, else
+    // the directory containing the requested cwd among the location
+    // directory and the live sessions' own directories (a client-claimed
+    // terminal opened in a cross-location session's folder), else the
+    // location directory.
+    const boundary = sessionDir ?? this.containingSessionDir(path) ?? this.opts.defaultDirectory;
     if (boundary !== undefined && !isPathInside(path, boundary)) {
       this.log(`terminal cwd ${path} is outside the session's working directory; clamping to ${fallback}`);
       return fallback;

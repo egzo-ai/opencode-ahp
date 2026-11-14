@@ -3,8 +3,10 @@
  * VS Code folder picker drives — `resourceResolve` (the existence check),
  * `resourceList` (navigating the server's filesystem), and `resourceMkdir`
  * (creating a new project directory). These are token-authenticated and
- * NOT location-confined: a client may name any path (matching the VS Code
- * reference agent host, which exposes the whole host filesystem).
+ * NOT location-confined: by default a client may name any path (matching
+ * the VS Code reference agent host, which exposes the whole host
+ * filesystem). The optional `allowedWorkingDirectories` option (design
+ * §3.3) scopes them to an allowlist of path prefixes.
  */
 
 import { HostChangesets } from "./host-changesets.js";
@@ -33,6 +35,7 @@ export class HostResources extends HostChangesets {
     const params = isRecord(msg.params) ? msg.params : {};
     const absPath = this.resourceUri(socketId, msg, params, "resourceResolve");
     if (absPath === null) return;
+    if (!(await this.resourceAllowed(socketId, msg, absPath))) return;
     // Absent / `true` follow symlinks (the default); only `false` stats
     // the path itself (lstat semantics).
     const followSymlinks = params["followSymlinks"] !== false;
@@ -69,6 +72,7 @@ export class HostResources extends HostChangesets {
     const params = isRecord(msg.params) ? msg.params : {};
     const absPath = this.resourceUri(socketId, msg, params, "resourceList");
     if (absPath === null) return;
+    if (!(await this.resourceAllowed(socketId, msg, absPath))) return;
     let entries;
     try {
       entries = await this.opts.facade.listDirectory(absPath);
@@ -95,6 +99,7 @@ export class HostResources extends HostChangesets {
     const params = isRecord(msg.params) ? msg.params : {};
     const absPath = this.resourceUri(socketId, msg, params, "resourceMkdir");
     if (absPath === null) return;
+    if (!(await this.resourceAllowed(socketId, msg, absPath))) return;
     try {
       await this.opts.facade.mkdirResource(absPath);
     } catch (err) {
@@ -124,6 +129,22 @@ export class HostResources extends HostChangesets {
       this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `${method} uri must be a file URI: ${uri}`);
       return null;
     }
+  }
+
+  /**
+   * The directory allowlist (the `allowedWorkingDirectories` option): the
+   * `resource*` commands are otherwise unconfined, so when the policy is
+   * restricted every `uri` must resolve under one of the prefixes (after
+   * symlink resolution). A denial is a flat -32009 — the message is
+   * deliberately identical for every denied path (no existence oracle);
+   * the full detail goes to the log.
+   */
+  private async resourceAllowed(socketId: number, msg: RpcMessage, absPath: string): Promise<boolean> {
+    const policy = this.opts.pathPolicy;
+    if (policy === undefined || (await policy.allows(absPath))) return true;
+    this.log(`resource command denied by the directory allowlist: ${absPath}`);
+    this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is not permitted by host policy");
+    return false;
   }
 
   /**

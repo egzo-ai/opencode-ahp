@@ -127,6 +127,7 @@ with the `opencode.jsonc` value winning. A few of the important ones:
 | `token` | auto | The credential clients must present, via `?token=…` in the URL or an `Authorization: Bearer` header. **Always enforced**, loopback or not. Omit to have the plugin generate one on first start — it's persisted in opencode's plugin storage and printed once to the server log (`[opencode-ahp] AHP token …`) |
 | `host` | `"127.0.0.1"` | Bind address; a **non-loopback bind requires an explicit `token`** (the listener refuses to start otherwise) |
 | `port` | `8765` | WS listen port |
+| `allowedWorkingDirectories` | `[]` (unrestricted) | Optional directory allowlist: absolute path prefixes that bound which paths a client may name (the `createSession.workingDirectories` target and the unconfined `resource*` commands). Opt-in hardening — the AHP token is a full client credential, so this scopes blast radius rather than sandboxing (design.md §3.3) |
 
 ## Quick start (this machine)
 

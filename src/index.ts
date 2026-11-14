@@ -14,6 +14,8 @@
  *      `enabled: false` → the plugin is fully inert (no listener)
  *   2. token: explicit option, else persisted in ctx.storage (generated
  *      once, printed once to the server log)
+ *   2b. directory allowlist (optional): a misconfigured
+ *       `allowedWorkingDirectories` fails closed (AHP off, R2)
  *   3. wire the Host (JSON-RPC router) to the transport (Bun.serve)
  *   4. start the opencode event pump (maps `ctx.event.subscribe` into
  *      the host's AHP action stream)
@@ -57,6 +59,7 @@ type SessionInfo = Awaited<ReturnType<SessionDomain["get"]>>;
  */
 type SessionCreateMetadata = NonNullable<Parameters<SessionDomain["create"]>[0]>["metadata"];
 import { isRecord, resolveOptions, type Options } from "./options.js";
+import { normalizeDirPrefix, PathPolicy } from "./path-policy.js";
 import { createListener, type Listener } from "./transport.js";
 import { Host } from "./host.js";
 import type { SpawnPty } from "./host-types.js";
@@ -298,6 +301,57 @@ function repoRelative(root: string, absPath: string): string | null {
 
 function isEnoent(err: unknown): boolean {
   return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+/**
+ * The allowlist's `PathPolicyEnv` (design §3.3): canonicalize the
+ * symlinks of the EXISTING prefix portion of `p` — walk up to the deepest
+ * existing ancestor, realpath it, re-append the missing tail (the result
+ * may not yet exist; the tail is never created). This is what keeps a
+ * symlink planted under an allowed prefix from escaping the allowlist
+ * (`/tmp/link → /home` resolves to `/home/…` and is denied). Throws when
+ * an existing ancestor cannot be canonicalized (e.g. EACCES) — the policy
+ * check then defers to the underlying operation's own errno error.
+ */
+async function resolveExistingPrefix(p: string): Promise<string> {
+  let base = p;
+  let tail: string | null = null;
+  for (;;) {
+    try {
+      const real = await realpath(base);
+      return tail === null ? real : join(real, tail);
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+      const parent = dirname(base);
+      if (parent === base) return p; // no existing ancestor (malformed) — lexical
+      const name = base.slice(parent.length + 1);
+      tail = tail === null ? name : join(name, tail);
+      base = parent;
+    }
+  }
+}
+
+/**
+ * The allowlist prefixes (the `allowedWorkingDirectories` option): each
+ * entry lexically normalized, and symlink-canonicalized when it exists —
+ * a prefix that IS a symlink covers its target. Entries that do not exist
+ * yet stay lexical (a `resourceMkdir` may create one later). Throws on a
+ * non-absolute entry or an existing-but-undecidable prefix — the caller
+ * fails closed (R2: AHP off, opencode keeps serving) rather than run
+ * unrestricted.
+ */
+async function resolveAllowedDirPrefixes(entries: string[]): Promise<string[]> {
+  const out = new Set<string>();
+  for (const entry of entries) {
+    let prefix = normalizeDirPrefix(entry); // throws when not absolute
+    try {
+      prefix = await realpath(prefix);
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+    }
+    out.add(prefix);
+  }
+  return [...out];
 }
 
 /**
@@ -866,6 +920,23 @@ export default Plugin.define({
       return; // R2: the opencode server stays up without AHP
     }
 
+    // 2b. Directory allowlist (the `allowedWorkingDirectories` option,
+    // design §3.3): resolve the prefixes (lexically normalized, and
+    // symlink-canonicalized when they exist). A non-absolute entry or an
+    // existing-but-undecidable prefix is a configuration error: fail
+    // closed (AHP off) rather than run unrestricted.
+    let pathPolicy: PathPolicy | undefined;
+    try {
+      const prefixes = await resolveAllowedDirPrefixes(opts.allowedWorkingDirectories);
+      pathPolicy =
+        prefixes.length > 0
+          ? PathPolicy.restricted(prefixes, { resolveExisting: resolveExistingPrefix })
+          : undefined;
+    } catch (e) {
+      console.error(`${TAG} invalid allowedWorkingDirectories (${errorMessage(e)}); not starting the AHP host`);
+      return; // R2: the opencode server stays up without AHP
+    }
+
     // 3. Host + transport. The host's send/close callbacks close over the
     // listener variable, which is assigned immediately after the host is
     // constructed (the listener's socket ids are the host's socket ids).
@@ -888,6 +959,7 @@ export default Plugin.define({
         changesets: opts.capabilities.changesets,
         terminals: opts.capabilities.terminals,
         spawnPty: createBunSpawnPty(),
+        pathPolicy,
         send: (socketId, message) => {
           listener?.sendTo({ id: socketId }, JSON.stringify(message));
         },

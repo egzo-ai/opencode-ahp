@@ -28,6 +28,21 @@
   // ["vscode://vscode"]. The token is always required regardless.
   // "allowedOrigins": "*",
 
+  // Directory allowlist: absolute path prefixes that
+  // bound which paths a client may name on the host — the
+  // createSession.workingDirectories target and the unconfined resource*
+  // commands (resourceResolve/resourceList/resourceMkdir). Absent or
+  // empty (default) → unrestricted (the default posture matches the VS
+  // Code reference host, which exposes the whole host filesystem to an
+  // authenticated client). A path is permitted when its symlink-resolved
+  // form is under one of the prefixes (a symlink under an allowed prefix
+  // that points outside is denied). The token is a full client credential
+  // (e.g. the agent's shell tool is not directory-confined), so this is
+  // blast-radius scoping, not a sandbox. A non-absolute entry is a
+  // configuration error: the host fails closed (AHP off, opencode keeps
+  // serving).
+  // "allowedWorkingDirectories": ["/tmp", "/home"],
+
   // Native TLS termination via Bun.serve → wss:// (off-LAN transports,
   // D3). Paths to the PEM key and certificate files; with this set the
   // port is TLS-only (health endpoint → `curl -k https://…/healthz`).
@@ -47,7 +62,7 @@
   // type) — with the raw `data` JSON (truncated to 300 chars). Off by
   // default: a busy turn emits dozens of lines. The LAN test server
   // script (scripts/ahp-server.mjs) enables it. Use it to attribute turn
-  // latency to host vs client vs model (design.md §8.1).
+  // latency to host vs client vs model.
   // "logEvents": true,
 
   // Host-side capability switches — never advertise what we don't
