@@ -406,7 +406,7 @@ Requests (methods with an `id`) routed by the host:
 | `dispatchAction` | Notification. See [§9](#9-client-dispatchable-actions). |
 | `listSessions` | All opencode sessions, most-recently-modified first, in-memory cursor pagination (`limit` default 100, `cursor` = offset). Unknown sessions are **lazily registered** (idempotent per opencode id) so their channels become subscribable. |
 | `resolveSessionConfig` | An honest empty schema (`{ type: "object", properties: {} }`, `values: {}`) — opencode collects no session-creation configuration; agent/model choice rides session customizations and the per-turn message. `provider`/`workingDirectory`/`config` params are accepted and ignored. VS Code calls this strictly before the first send of a new session, so an unimplemented host makes every fresh session unstartable. |
-| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The client-chosen `channel` is accepted in the standard `ahp-session:/<suffix>` form or the non-standard `<scheme>:/<suffix>` form — client legacy addressing: VS Code mints `<provider>:/<uuid>` when its `initialize` result is not yet available at draft-creation time (its `isNativeAgentHost`/`vscode.ahpSessionUris` capability checks never fire without one, and we send no `_meta` to influence them), and the AHP reference client creates sessions the same way (verified 2026-11-13) — and is echoed back verbatim; the channel stays subscribable through the registry's live session-channel set. A channel that is a live pty terminal channel is refused (the two resource sets must stay disjoint). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (a channel that is not a session URI — rejected channels are logged with the offending value — or a live terminal channel; malformed `workingDirectories` or `activeClient`), `-32009` (`workingDirectories` target outside the [`allowedWorkingDirectories` allowlist](#33-directory-allowlist-allowedworkingdirectories), before any backend work), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
+| `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The client-chosen `channel` is accepted in the standard `ahp-session:/<suffix>` form or the non-standard `<scheme>:/<suffix>` form — client legacy addressing: VS Code mints `<provider>:/<uuid>` when its `initialize` result is not yet available at draft-creation time (its `isNativeAgentHost`/`vscode.ahpSessionUris` capability checks never fire without one, and we send no `_meta` to influence them), and the AHP reference client creates sessions the same way — and is echoed back verbatim; the channel stays subscribable through the registry's live session-channel set. A channel that is a live pty terminal channel is refused (the two resource sets must stay disjoint). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (a channel that is not a session URI — rejected channels are logged with the offending value — or a live terminal channel; malformed `workingDirectories` or `activeClient`), `-32009` (`workingDirectories` target outside the [`allowedWorkingDirectories` allowlist](#33-directory-allowlist-allowedworkingdirectories), before any backend work), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
 | `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI (the owner must be a session channel under the `createSession` rule — standard or legacy form); publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
 | `disposeChat` | `null`. Removes a peer chat (never the default chat) and its opencode backend session; publishes `session/chatRemoved`. AHP-side unbind happens *before* the backend removal so the racing `session.deleted` event doesn't double-publish. |
 | `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory or one of the live sessions' own working directories), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside every session's working directory. |
@@ -542,7 +542,7 @@ in and its session-scoped surfaces (changesets, snapshot paths, terminal
 `cwd`) are confined to it. Peer-chat backends run in the owner's
 location — a working-directories session's chats are not forked into the
 plugin's own location. Cross-location sessions are fully live-verified
-against the test server (2026-11-13): opencode boots the target location
+against the test server: opencode boots the target location
 on the first `createSession`, the plugin's event pump sees its session
 events, and `session.list`/`get` are app-level.
 
@@ -671,7 +671,7 @@ publish. The consequence lands on client actions that treat an entry's
 the URI through the client's own file service, so from a remote client
 it reads a host-machine path that does not exist on the client (the
 panel reports a file-read error for the test server's `/tmp/…`
-directory URI — verified 2026-11-14), and even a same-machine read
+directory URI), and even a same-machine read
 would fail, since the URI names a directory, not a file. Per-server
 configuration provenance (a file URI with a range into the defining
 config) is an opencode upstream request (futures.md §4.1).
@@ -757,14 +757,14 @@ stays usable, just without its customization surface.
 a cross-location session (created with `workingDirectories`, or created
 elsewhere in another location) shows the host location's catalog — the
 same provenance caveat as the agents. Live-verified against the test
-server (2026-11-13, `scripts/ahp-customizations.mjs`): the agent and
+server (`scripts/ahp-customizations.mjs`): the agent and
 skill containers match the server's own `/api/agent` / `/api/skill`
 (including the virtual-`skill://` built-ins), a connected MCP server
 renders `ready` under its display title, `serverTools` is non-empty and
 shaped (MCP-contributed tools included, no client-tool echo), and an
 externally-created session converges on the catalog through the
-change-action pair. The MCP toggle was live-verified on 2026-11-14
-with the same script: disabling a connected server via
+change-action pair. The MCP toggle was live-verified with the same
+script: disabling a connected server via
 `session/customizationToggled` (accepted; the re-pushed entry is
 `stopped` with the workspace disable `enablement`; `/api/mcp` reports
 `disabled`), toggling the agent directory rejected with the
@@ -1048,7 +1048,7 @@ semantics as the core git adapter — `git diff --name-status/-z HEAD` +
 `git status --porcelain=v1 -z` (untracked), `--numstat` for line counts,
 run with the session directory as cwd and a `-- .` pathspec (the output
 paths are repo-root-relative regardless of cwd — verified against git
-2.47.3, 2026-11-13). Any git failure yields an empty diff (R2).
+2.47.3). Any git failure yields an empty diff (R2).
 
 File content is served via `resourceRead` from three URI forms:
 
@@ -1299,8 +1299,8 @@ iteration), and force-stops the listener (`stop(true)`, dropping every
 connection): a graceful stop lets open WebSockets outlive the stop,
 and the port stays bound while they drain — a location reload racing
 that window fails to rebind the AHP port, degrading the fresh location
-while the stale socket keeps serving (observed on the test server,
-2026-11-14; a unit test pins the force flag). The teardown logs a
+while the stale socket keeps serving (observed on the test server; a
+unit test pins the force flag). The teardown logs a
 single line — a torn-down listener with no log line is otherwise
 undiagnosable.
 
@@ -1401,8 +1401,8 @@ location's activity counter only for durable session events whose
 the plugin host runs plugin effects in a minimal fiber context (Scope
 and loggers only, `packages/core/src/plugin.ts`), so when
 `Session.setMetadata` publishes `session.metadata.updated`, the envelope's
-optional `location` is unset and the touch is ignored. Verified live
-2026-11-12: the anchor-session touches arrived on the raw event stream
+optional `location` is unset and the touch is ignored. Verified live:
+the anchor-session touches arrived on the raw event stream
 (`GET /api/event`) every minute **without** a `location` field, while
 the location was still idle-evicted exactly 60 minutes after the last
 real activity. A plugin-side keep-alive based on periodic durable

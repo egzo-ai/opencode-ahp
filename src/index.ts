@@ -924,7 +924,7 @@ function implementFacade(
               // (only the outer `execute` call does), so the host could
               // never see the call to track + relay to the client.
               // `codemode: false` keeps it out of the catalog and in
-              // the direct list (live finding 2026-11-08).
+              // the direct list.
               options: { codemode: false },
               execute: async (_input: unknown, context: ToolContext) => {
                 const host = hostRef.current;

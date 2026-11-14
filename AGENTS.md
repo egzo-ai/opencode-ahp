@@ -129,14 +129,21 @@ testing: `docs/testing.md`).
   changes MUST preserve it, land in the doc whose purpose covers the
   content, and be written in its register. House style is prose: no
   checkboxes, no strikethrough.
+- **No observation/verification dates.** A fact learned from debugging,
+  live verification, or upstream research is stated in the present
+  tense with no date attached — in docs and in source-code comments
+  alike. The date is immaterial to the fact; a dated "(verified
+  <date>)" note is discovery-log phrasing, not current-state prose.
+  A date that is itself the fact (e.g. an upstream release's
+  published date) is different and stays.
 - [`docs/design.md`](docs/design.md) — the **current** design: use cases,
   architecture, lifecycle, protocol surface, error/recovery/persistence,
   and *why* the code is shaped that way. Behavior, architecture, and
   wire-contract changes MUST update it; new topics get a new §. It states
   what is true **now**, in present tense: fold learnings from debugging or
-  live verification into the relevant section as current-state prose (a
-  short "(verified <date>)" note is fine). Dated "findings" labels,
-  discovery-log phrasing, and completed checklists do not belong there.
+  live verification into the relevant section as current-state prose.
+  Dated "findings" labels, discovery-log phrasing, and completed
+  checklists do not belong there.
 - [`docs/futures.md`](docs/futures.md) — **potential work only**: work
   candidates, gaps, upstream requests. Durable facts (e.g. how a client
   behaves today) belong in design.md; futures items cross-reference them.

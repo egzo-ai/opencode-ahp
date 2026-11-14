@@ -480,7 +480,7 @@ export function mapAgentCustomizations(agents: readonly FacadeAgent[]): AgentCus
  * Attached to every `AgentInfo.customizations` (feeds the Agents
  * window's agent picker before any session exists) and to live
  * `SessionState.customizations` (the picker reads session-state
- * customizations — the root-cause fix for the empty dropdown, 2026-11-08).
+ * customizations — the root-cause fix for the empty dropdown).
  * `writable: false` — clients never write agents into the
  * workspace through this host.
  */
@@ -712,7 +712,7 @@ export function mapServerTools(
 
 /**
  * Map the opencode catalog to the AHP root state's `agents` list.
- * Mapping locked 2026-11-07:
+ * Mapping locked:
  *  - one AgentInfo per opencode provider;
  *  - providers with activation "disabled" are excluded;
  *  - models with enabled: false are excluded;

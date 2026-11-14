@@ -21,7 +21,7 @@ conformance), see [`docs/testing.md`](testing.md).
 Protocol facts are verified against the installed
 `@microsoft/agent-host-protocol@1.0.0` dist (the wire ground truth) and
 the upstream [`microsoft/agent-host-protocol`](https://github.com/microsoft/agent-host-protocol)
-repository (checked 2026-11-09). opencode findings are verified against
+repository. opencode findings are verified against
 v2.2.6 source and current `main` where noted.
 
 ---
@@ -231,7 +231,7 @@ would have no tool access to it. That is the request in
 
 **No client drives it today.** The capability gates all multiroot
 affordances, and the VS Code 1.145.2 workbench carries no reference to
-`multipleWorkingDirectories` (stable-bundle grep, 2026-11-13) — nothing
+`multipleWorkingDirectories` (stable-bundle grep) — nothing
 in the field sends more than one working directory or any of the five
 actions.
 
@@ -415,11 +415,11 @@ synthetic terminals are read-only renderings of shell-tool calls
 
 The upgrade is **potential, not planned** — nothing on the client side
 can force it, and nothing in the current feature set needs it
-([§3.1](#31-status-verified-2026-11-09)). What follows is the state of
+([§3.1](#31-status)). What follows is the state of
 the question, and what an upgrade would involve if and when it becomes
 worth doing.
 
-### 3.1 Status (verified 2026-11-09)
+### 3.1 Status
 
 - **npm:** the latest published `@microsoft/agent-host-protocol` is
   **1.0.0** (published 2026-10-03). There is no 1.1.x release.
@@ -436,7 +436,7 @@ worth doing.
 
 ### 3.2 What is in flight on upstream main
 
-Read from the registry maps on `main` (2026-11-09):
+Read from the registry maps on `main`:
 
 - **Actions introduced in 1.1.0:** `chat/configChanged`, `chat/moved`
   (the companion to the 1.0.0 `moveChat` command).

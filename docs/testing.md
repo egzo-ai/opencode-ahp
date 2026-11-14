@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Nine suites, 375 tests as of 2026-11-14, a few
+(`vitest.config.ts`). Nine suites, 376 tests, a few
 seconds wall time:
 
 ```sh
@@ -189,7 +189,7 @@ value in a token query parameter in transit (the parameter arrives as
 `***`), and the resulting 401 is a tooling artifact, not a server
 finding. The flag form (`--token "$TOKEN"`) is unaffected; a full curl
 upgrade replica with a runtime-assembled token upgrades cleanly (101),
-as does every other header shape (verified 2026-11-14).
+as does every other header shape.
 
 **Troubleshooting — AHP port dead but the server is up** (`healthz` →
 connection refused, :4098 still 200): the location was evicted or the
@@ -341,13 +341,13 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 The AHP repo ships a language-independent conformance corpus in
 [`types/test-cases`](https://github.com/microsoft/agent-host-protocol/tree/main/types/test-cases).
 It is the exit criterion for the host: **green for every capability the
-host advertises**. It was first run on 2026-11-09 and is green
-([§5.6](#56-results-2026-11-09-first-run)); this section records what the
+host advertises**. It was first run and is green
+([§5.6](#56-results-first-run)); this section records what the
 corpus is, why it validates this host, and how to execute it.
 
 ### 5.1 The corpus
 
-Three fixture families (verified against the repo at 2026-11-09):
+Three fixture families (verified against the repo):
 
 | Family | Contents | Fixture shape |
 | --- | --- | --- |
@@ -383,7 +383,7 @@ covers:
 | `src/state.ts` — every channel state store (root, session, chat, changeset, terminal — the five channels the host implements) | the official `rootReducer` / `sessionReducer` / `chatReducer` / `changesetReducer` / `terminalReducer` | the `reducers/` corpus (the fixtures for the channels the host does not implement — canvas, annotations, resource-watch, automations — validate the package only) |
 | wire encoding/decoding | the package's generated types + `JSON.parse`/`stringify` | the `round-trips/` corpus |
 
-Verified (2026-11-09): the installed
+Verified: the installed
 `@microsoft/agent-host-protocol@1.0.0` package's `src/` is byte-identical
 to the `spec/v1.0.0` tag (`clients/typescript/src` verbatim; the canonical
 `types/` modulo a 3-line "Generated" header). So a green suite at the
@@ -451,14 +451,14 @@ of this host's conformance pass.
 
 ### 5.5 Status
 
-Run and green as of the 2026-11-09 first pass
-([§5.6](#56-results-2026-11-09-first-run)). The pass was deliberately
+Run and green as of the first pass
+([§5.6](#56-results-first-run)). The pass was deliberately
 scheduled last — after the other [`futures.md`](futures.md) candidates
 land or are set aside — so it validates the full advertised surface.
 Re-run `scripts/ahp-conformance.mjs` whenever new capabilities are turned
 on, the pinned AHP package changes, or the `spec/v1.0.0` corpus moves.
 
-### 5.6 Results (2026-11-09 first run)
+### 5.6 Results (first run)
 
 First pass via `scripts/ahp-conformance.mjs`, `spec/v1.0.0`
 tag at `5f16d81b` ("release: AHP 1.0.0"):

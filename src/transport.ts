@@ -276,7 +276,7 @@ export function createListener(opts: ListenerOptions, callbacks: TransportCallba
       // own, and the port stays bound while they do — a location reload
       // racing that window fails to rebind ("Is port in use?"), leaving
       // the fresh host listener-less while the stale socket keeps serving
-      // (observed on the LAN test server, 2026-11-14). Teardown means
+      // (observed on the LAN test server). Teardown means
       // "the location is going" anyway, so dropping the connections is
       // the right semantics regardless.
       server.stop(true);
