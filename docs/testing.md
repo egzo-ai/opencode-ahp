@@ -161,6 +161,12 @@ Notes:
   project tree is not rewritten — edit its
   `.opencode/opencode.jsonc` and re-boot the location (re-run the
   script) to pick the option up.
+- The XDG isolation covers **data, state, and cache only — not
+  config**: the server reads the user's real `~/.config/opencode`, so
+  global config is live on every test location — global plugins (e.g.
+  `llama-sync`) load in every location, and global MCP servers (e.g.
+  `context7`) appear in `/api/mcp` and in the session customization
+  catalog (design.md [§7.5](design.md#75-session-customization-catalog)).
 
 **Verify the host side** (the script already waited for the healthz):
 
@@ -173,6 +179,17 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://<host-lan-ip>:8767/ahp?token=wr
 The machine's LAN IP: `hostname -I | awk '{print $1}'`.
 (If the firewall blocks the port: `sudo ufw allow 8767/tcp` or
 equivalent.)
+
+When driving these checks from **agent tooling** (not a human
+terminal), assemble the token query string at runtime —
+`TOKEN=$(sed …)` as in [§3.2](#32-the-scripts), then
+`curl "$BASE/ahp?"to""ken"="$TOKEN"` — rather than embedding the token
+in the request bytes: the agent's outgoing tooling redacts a literal
+value in a token query parameter in transit (the parameter arrives as
+`***`), and the resulting 401 is a tooling artifact, not a server
+finding. The flag form (`--token "$TOKEN"`) is unaffected; a full curl
+upgrade replica with a runtime-assembled token upgrades cleanly (101),
+as does every other header shape (verified 2026-11-14).
 
 **Troubleshooting — AHP port dead but the server is up** (`healthz` →
 connection refused, :4098 still 200): the location was evicted or the

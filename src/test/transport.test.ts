@@ -177,4 +177,39 @@ describe("createListener", () => {
     expect(withTls?.tls).toEqual({ key: "KEY-PEM", cert: "CERT-PEM" });
     expect("tls" in (withoutTls ?? {})).toBe(false);
   });
+
+  it("force-stops the Bun server on stop() so a reload can rebind the port", () => {
+    const stopCalls: unknown[][] = [];
+    const fakeBun = {
+      serve: () => ({
+        port: 1,
+        stop: (...args: unknown[]) => {
+          stopCalls.push(args);
+        },
+        upgrade: () => ({ success: true }),
+      }),
+    };
+    const g = globalThis as { Bun?: unknown };
+    const prev = g.Bun;
+    g.Bun = fakeBun;
+    try {
+      const l = createListener(
+        {
+          host: "127.0.0.1",
+          port: 1,
+          path: "/ahp",
+          healthPath: "/healthz",
+          token: "t",
+          allowedOrigins: "*",
+        },
+        noop,
+      );
+      l.stop();
+    } finally {
+      g.Bun = prev;
+    }
+    // A graceful stop() leaves open WebSockets draining and the port
+    // bound; a location reload racing that window cannot rebind.
+    expect(stopCalls).toEqual([[true]]);
+  });
 });

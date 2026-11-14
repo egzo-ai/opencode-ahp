@@ -157,7 +157,9 @@ interface BunUpgradeResult {
 }
 interface BunServer {
   port: number;
-  stop(): void;
+  /** `force`: synchronously drain every connection instead of letting
+   *  open WebSockets outlive the stop (Bun server.stop(force?)). */
+  stop(force?: boolean): void;
   upgrade(req: BunRequest, options?: { data?: unknown }): BunUpgradeResult;
 }
 interface BunServeOptions {
@@ -270,7 +272,14 @@ export function createListener(opts: ListenerOptions, callbacks: TransportCallba
       if (ws && ws.readyState === 1) ws.close(code, reason);
     },
     stop() {
-      server.stop();
+      // Force stop: a graceful stop lets open WebSockets drain on their
+      // own, and the port stays bound while they do — a location reload
+      // racing that window fails to rebind ("Is port in use?"), leaving
+      // the fresh host listener-less while the stale socket keeps serving
+      // (observed on the LAN test server, 2026-11-14). Teardown means
+      // "the location is going" anyway, so dropping the connections is
+      // the right semantics regardless.
+      server.stop(true);
       openSockets.clear();
     },
   };

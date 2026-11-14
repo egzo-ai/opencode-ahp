@@ -539,11 +539,24 @@ Ordered by impact. Findings verified against v2.2.6 source and current
    `serverTools` when an MCP server adds or removes tools
    ([§1.6](#16-live-re-push-of-the-session-customization-catalog)).
    Long-term; no current client need.
+10. **Per-MCP-server configuration provenance** — the MCP status list
+   a plugin can see is name, title, and status: no config file, no
+   key path. The host therefore anchors every `McpServerCustomization`
+   at the session's directory URI — provenance of *where the server
+   is in effect*, not of what defines it (design.md
+   [§7.5](design.md#75-session-customization-catalog), **Provenance
+   limit**) — and client actions that open that URI as a file fail
+   (VS Code's Customizations "Edit Configuration": on a remote client
+   the path does not exist at all, and on the host machine the URI
+   names a directory, not a file). A configuration-provenance field
+   (the defining file URI, plus a range into it) would let the host
+   publish a true `file://` URI and make such actions work for
+   servers defined in a readable config file.
 
 Impact note: #1 changes the deployment UX (zero-touch boot), #2 removes
 the mandatory config entry (the idle timeout), #4 is the only path to
 remote elicitation — the three that change the shape of the product.
-#3 and #5–#9 are on-demand feature unlocks.
+#3 and #5–#10 are on-demand feature unlocks.
 
 ### 4.2 VS Code — upstream requests & watches
 

@@ -662,6 +662,20 @@ enabled server omits the field, since the panel's effective-enabled
 value is `enablement[0].enabled ?? true` and an absent field means
 enabled by default.
 
+**Provenance limit.** The directory URI says *where the server is in
+effect*, not what defines it: opencode's plugin surface carries no
+per-server configuration provenance — the MCP status list is name,
+title, and status only — so the host has no defining file URI to
+publish. The consequence lands on client actions that treat an entry's
+`uri` as a file: VS Code's Customizations "Edit Configuration" opens
+the URI through the client's own file service, so from a remote client
+it reads a host-machine path that does not exist on the client (the
+panel reports a file-read error for the test server's `/tmp/…`
+directory URI — verified 2026-11-14), and even a same-machine read
+would fail, since the URI names a directory, not a file. Per-server
+configuration provenance (a file URI with a range into the defining
+config) is an opencode upstream request (futures.md §4.1).
+
 **MCP state mapping.** opencode's live `Mcp.Status` maps to the AHP
 `McpServerState` as: `connected` → `ready`, `pending` → `starting`,
 `disabled` → `stopped`, `failed` → `error` (`errorType: "mcp.failed"`,
@@ -1281,9 +1295,14 @@ The plugin's cleanup kills every live pty
 terminal (`stopTerminals` — a still-running process gets a final
 `terminal/exited` so subscribers see the row exit rather than the socket
 drop), aborts the event pump (ending the `ctx.event.subscribe`
-iteration), and stops the listener (dropping every connection). The
-teardown logs a single line — a torn-down listener with no log line is
-otherwise undiagnosable.
+iteration), and force-stops the listener (`stop(true)`, dropping every
+connection): a graceful stop lets open WebSockets outlive the stop,
+and the port stays bound while they drain — a location reload racing
+that window fails to rebind the AHP port, degrading the fresh location
+while the stale socket keeps serving (observed on the test server,
+2026-11-14; a unit test pins the force flag). The teardown logs a
+single line — a torn-down listener with no log line is otherwise
+undiagnosable.
 
 ## 14. Error handling & graceful degradation
 
