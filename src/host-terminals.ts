@@ -603,7 +603,6 @@ export class HostTerminals extends HostResources {
    * record itself is retained (retention); only the state moves on.
    */
   protected finishTerminal(
-    chat: ChatRuntime,
     toolCallId: string,
     result: { ok: true; content: FacadeToolContent[] } | { ok: false; message: string },
   ): void {

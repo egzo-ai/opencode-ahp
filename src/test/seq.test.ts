@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ActionType } from "@microsoft/agent-host-protocol";
 import { Sequencer, type ActionDraft } from "../seq.js";
 
-const draft = (n: number): ActionDraft => ({
+const draft = (): ActionDraft => ({
   channel: "ahp-root://",
   action: { type: ActionType.RootAgentsChanged, agents: [] },
 });
@@ -17,14 +17,14 @@ describe("Sequencer", () => {
 
   it("assigns strictly increasing global seqs", () => {
     const s = new Sequencer(10);
-    const envs = [1, 2, 3].map((n) => s.publish(draft(n)));
+    const envs = [1, 2, 3].map(() => s.publish(draft()));
     expect(envs.map((e) => e.serverSeq)).toEqual([1, 2, 3]);
     expect(s.seq).toBe(3);
   });
 
   it("since(s) returns envelopes with serverSeq > s, in order", () => {
     const s = new Sequencer(10);
-    for (let i = 0; i < 5; i++) s.publish(draft(i));
+    for (let i = 0; i < 5; i++) s.publish(draft());
     expect(s.since(0)!.map((e) => e.serverSeq)).toEqual([1, 2, 3, 4, 5]);
     expect(s.since(2)!.map((e) => e.serverSeq)).toEqual([3, 4, 5]);
     expect(s.since(4)!.map((e) => e.serverSeq)).toEqual([5]);
@@ -34,13 +34,13 @@ describe("Sequencer", () => {
 
   it("clamps a negative since to 0", () => {
     const s = new Sequencer(10);
-    s.publish(draft(0));
+    s.publish(draft());
     expect(s.since(-5)!.map((e) => e.serverSeq)).toEqual([1]);
   });
 
   it("bounds the replay window: evicted ranges are null (snapshot fallback)", () => {
     const s = new Sequencer(3);
-    for (let i = 0; i < 5; i++) s.publish(draft(i));
+    for (let i = 0; i < 5; i++) s.publish(draft());
     // buffer holds 3,4,5
     expect(s.seq).toBe(5);
     expect(s.oldest).toBe(3);
@@ -52,13 +52,13 @@ describe("Sequencer", () => {
   it("stamps origin and rejectionReason when present", () => {
     const s = new Sequencer(10);
     const a = s.publish({
-      ...draft(0),
+      ...draft(),
       origin: { clientId: "c1", clientSeq: 9 },
       rejectionReason: "unsupported action: root/agentsChanged",
     });
     expect(a.origin).toEqual({ clientId: "c1", clientSeq: 9 });
     expect(a.rejectionReason).toBe("unsupported action: root/agentsChanged");
-    const b = s.publish(draft(1));
+    const b = s.publish(draft());
     expect(b.origin).toBeUndefined();
     expect(b.rejectionReason).toBeUndefined();
   });

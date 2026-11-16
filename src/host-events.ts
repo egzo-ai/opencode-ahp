@@ -264,7 +264,7 @@ export class HostEvents extends HostDispatch {
         // tool's terminal event (before the turn guard — a command that
         // finishes after its turn was torn down still exits its
         // terminal; no-op when the call never opened one).
-        this.finishTerminal(chat, ev.id, { ok: true, content: ev.content });
+        this.finishTerminal(ev.id, { ok: true, content: ev.content });
         if (chat.currentTurnId === null) return;
         this.ensureToolReady(chat, ev.id, false);
         if (this.toolCallTerminal(chat, ev.id)) {
@@ -293,7 +293,7 @@ export class HostEvents extends HostDispatch {
         return;
       }
       case "tool.failed": {
-        this.finishTerminal(chat, ev.id, { ok: false, message: ev.error.message });
+        this.finishTerminal(ev.id, { ok: false, message: ev.error.message });
         if (chat.currentTurnId === null) return;
         this.ensureToolReady(chat, ev.id, false);
         if (this.toolCallTerminal(chat, ev.id)) {

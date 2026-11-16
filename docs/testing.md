@@ -65,8 +65,13 @@ server. Recapture it whenever opencode's event catalog changes shape.
 
 ## 2. Static checks & CI
 
-- `pnpm typecheck` — `tsc --noEmit` (strict, NodeNext) over `src/`
-  **including the tests**.
+- `pnpm typecheck` — `tsc --noEmit` (strict, NodeNext, plus
+  `noUnusedLocals`/`noUnusedParameters`, `noImplicitReturns`,
+  `noFallthroughCasesInSwitch`, `noImplicitOverride`,
+  `noUncheckedSideEffectImports`, and `erasableSyntaxOnly` — the source
+  uses only erasable TS syntax, no enums/parameter-properties/
+  namespaces, so it stays loadable without a transform step) over
+  `src/` **including the tests**.
 - Toolchain (Node 26 + pnpm) is managed by `mise.toml` — pnpm's version
   comes from the `packageManager` field in `package.json`. First-time
   setup: `mise trust && mise install && mise run setup`.

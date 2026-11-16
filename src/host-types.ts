@@ -2,7 +2,7 @@
  * Record types shared by the host section classes: the per-socket, per-client, per-session, per-chat and per-terminal state shapes, and the HostOptions the Host is constructed with.
  */
 
-import { ActionType, ReconnectResultType, Implementation, SessionSummary } from "@microsoft/agent-host-protocol";
+import { Implementation } from "@microsoft/agent-host-protocol";
 import { OpencodeFacade } from "./bridge.js";
 import { ClientToolInvocation } from "./client-tools.js";
 import { ChatStateStore, ChangesetStateStore, SessionStateStore, TerminalStateStore } from "./state.js";

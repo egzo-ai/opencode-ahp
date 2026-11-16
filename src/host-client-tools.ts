@@ -3,7 +3,7 @@
  */
 
 import { HostTurns } from "./host-turns.js";
-import { ActionType, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, SessionActiveClient, SessionToolConfirmationRequest, ToolCallConfirmationState, ToolCallState } from "@microsoft/agent-host-protocol";
+import { ActionType, ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, SessionActiveClient, ToolCallConfirmationState, ToolCallState } from "@microsoft/agent-host-protocol";
 import { invocationMessageFor, FacadeClientTool, FacadeClientToolResult } from "./bridge.js";
 import { descriptionFor, findProvider, inputSchemaFor, toolUnion, ClientToolInvocation } from "./client-tools.js";
 import { ChatRuntime, SessionRecord } from "./host-types.js";

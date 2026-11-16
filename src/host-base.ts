@@ -4,7 +4,7 @@
 
 import { ActionType, ChangesetStatus, ActionEnvelope, ActionOrigin, ChatAction, ChatSummary, ChangesetAction, RootAction, SessionAction, SessionSummary, StateAction, TerminalAction } from "@microsoft/agent-host-protocol";
 import { buildSessionSummary, chatSummaryOf, directoryUri, sessionSummaryStatus, type FacadeSession } from "./bridge.js";
-import { ChannelRegistry, ChannelKind, ROOT_CHANNEL, channelKind, parseChangesetChannel, sessionIDOf } from "./channels.js";
+import { ChannelRegistry, ChannelKind, ROOT_CHANNEL, channelKind, parseChangesetChannel } from "./channels.js";
 import { Sequencer } from "./seq.js";
 import { createChangesetStateStore, createRootStateStore, ChangesetStateStore, RootStateStore } from "./state.js";
 import { SocketState, ClientRecord, ChatRuntime, SessionRecord, TerminalRecord, HostOptions } from "./host-types.js";

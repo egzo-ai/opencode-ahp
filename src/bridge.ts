@@ -1383,7 +1383,6 @@ export function pastTenseMessageFor(toolName: string, inputText: string | undefi
  * The "after" side of uncommitted/session changes is the live disk path
  * itself (`file://`), read through `resourceRead` at view time.
  */
-const CONTENT_REF_PREFIX = "ahp-content://";
 const CONTENT_HEAD_MARKER = "ahp-content://head/";
 const CONTENT_SNAP_MARKER = "ahp-content://snap/";
 

@@ -15,7 +15,6 @@ import {
   SessionStatus,
   ToolCallStatus,
   TurnState,
-  type ActionEnvelope,
   type AgentCustomization,
   type ChatState,
   type DirectoryCustomization,

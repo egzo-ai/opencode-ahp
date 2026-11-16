@@ -31,10 +31,13 @@ export interface PathPolicyEnv {
  * list is the unrestricted policy.
  */
 export class PathPolicy {
-  private constructor(
-    private readonly prefixes: readonly string[],
-    private readonly env?: PathPolicyEnv,
-  ) {}
+  private readonly prefixes: readonly string[];
+  private readonly env?: PathPolicyEnv;
+
+  private constructor(prefixes: readonly string[], env?: PathPolicyEnv) {
+    this.prefixes = prefixes;
+    this.env = env;
+  }
 
   /** No prefixes — every path is permitted. */
   static unrestricted(): PathPolicy {

@@ -3,7 +3,7 @@
  */
 
 import { HostSessions } from "./host-sessions.js";
-import { ActionType, SessionInputRequestKind, SessionStatus, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
+import { ActionType, SessionInputRequestKind, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
 import { FacadeDelivery, MCP_CUSTOMIZATION_ID_PREFIX } from "./bridge.js";
 import { normalizeToolDefinitions } from "./client-tools.js";
 import { channelKind, parseChangesetChannel } from "./channels.js";
