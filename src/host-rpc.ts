@@ -171,6 +171,9 @@ export class HostRpc extends HostEvents {
       case "createSession":
         await this.handleCreateSession(socketId, msg);
         break;
+      case "disposeSession":
+        await this.handleDisposeSession(socketId, msg);
+        break;
       case "createChat":
         await this.handleCreateChat(socketId, msg);
         break;

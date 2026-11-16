@@ -1,5 +1,5 @@
 /**
- * Session section (design §7): `createSession`/`listSessions`/`resolveSessionConfig`, external session registration (TUI/restart resurfacing, AHP markers, peer-chat re-attach), and record removal.
+ * Session section (design §7): `createSession`/`disposeSession`/`listSessions`/`resolveSessionConfig`, external session registration (TUI/restart resurfacing, AHP markers, peer-chat re-attach), and record removal.
  */
 
 import { HostChats } from "./host-chats.js";
@@ -35,7 +35,7 @@ import { ROOT_CHANNEL, chatChannelURI, isSessionChannel, sessionChannelURI, sess
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { createSessionStateStore } from "./state.js";
-import { ERROR_INTERNAL, ERROR_NO_PROVIDER, ERROR_PERMISSION_DENIED, ERROR_SESSION_EXISTS } from "./host-errors.js";
+import { ERROR_INTERNAL, ERROR_NO_PROVIDER, ERROR_PERMISSION_DENIED, ERROR_SESSION_EXISTS, ERROR_SESSION_NOT_FOUND } from "./host-errors.js";
 import { RpcMessage, SessionRecord } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, AHP_METADATA_KEY, parseAhpMarker, errorMessage, firstEnabledModelRef, normalizeActiveClient } from "./host-util.js";
 
@@ -355,6 +355,58 @@ export class HostSessions extends HostChats {
       summary: this.sessionSummary(rec),
     });
 
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+  }
+
+  /**
+   * `disposeSession` (AHP 1.0.0 session-channel command): dispose an AHP
+   * session and every opencode backend behind it — the default backend
+   * and each peer chat's backend. Result: `null`; the client's removal
+   * signal is the `root/sessionRemoved` notification `removeRecord`
+   * publishes (with the `root/activeSessionsChanged` count update),
+   * which always precedes the response. The channel is accepted in the
+   * same standard/legacy forms `createSession` echoes back, and an
+   * unknown channel answers -32001 (a channel that was a session but is
+   * already gone — e.g. disposed twice or deleted in the TUI first).
+   *
+   * The AHP-side unbind goes FIRST (the same race guard as
+   * `disposeChatBackend`): opencode's `session.deleted` event for each
+   * backend races this call through the event pump, and the pump's
+   * `byOpencode` guard must see the bindings already dropped — for the
+   * default backend a late binding would run `removeRecord` a second
+   * time (duplicate `root/sessionRemoved`), for a peer it would publish
+   * a `session/chatRemoved` for a chat whose record is already gone.
+   * `removeRecord` fires the peer backends' removals on the way (its
+   * standing behavior for the external-deletion path); the default
+   * backend is removed here, awaited, so a `listSessions` after the
+   * response does not resurface it lazily. R2: a failed backend removal
+   * still drops the AHP session — the lingering opencode session shows
+   * up in the TUI (and lazily in `listSessions`) until deleted there.
+   */
+  protected async handleDisposeSession(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    if (typeof channel !== "string" || !isSessionChannel(channel)) {
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_PARAMS,
+        "disposeSession requires a session channel (ahp-session:/… or <provider>:/…)",
+      );
+      return;
+    }
+    const rec = this.byChannel.get(channel);
+    if (rec === undefined) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, `no such session: ${channel}`);
+      return;
+    }
+    const defaultBackend = rec.sessionID;
+    this.removeRecord(rec);
+    try {
+      await this.opts.facade.removeSession(defaultBackend);
+    } catch (err) {
+      this.log(`failed to remove the session's opencode session ${defaultBackend}: ${errorMessage(err)}`);
+    }
     this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
   }
 

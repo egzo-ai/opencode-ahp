@@ -3523,6 +3523,15 @@ async function disposeChat(h: Harness, socketId: number, chatChannel: string, id
   return h.frames.find((f) => f.socketId === socketId && f.message.id === id)!.message;
 }
 
+async function disposeSession(h: Harness, socketId: number, sessionChannel: string, id: number): Promise<Record<string, any>> {
+  h.send(socketId, "disposeSession", { channel: sessionChannel }, id);
+  await waitFor(
+    () => h.frames.some((f) => f.socketId === socketId && f.message.id === id && (f.message.result !== undefined || f.message.error)),
+    `disposeSession response (${id})`,
+  );
+  return h.frames.find((f) => f.socketId === socketId && f.message.id === id)!.message;
+}
+
 /** Create a session on channel suffix `ses`; returns the default chat's
  * opencode session id (suffixes starting with "ses" pass through as the
  * opencode id — the existing createSession behavior). */
@@ -4101,6 +4110,122 @@ describe("chat-binding durability", () => {
     expect(sub.error).toBeUndefined();
     expect(sub.result.snapshot.resource).toBe(original);
     expect(sub.result.snapshot.state.chats).toHaveLength(1);
+    h.stop();
+  });
+});
+
+// ── disposeSession ───────────────────────────────────────
+
+describe("disposeSession", () => {
+  it("disposes the session and its backend, announces the removal on root, and answers null", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("ses_disp"), { provider: "gpuz" });
+    expect(h.notification("root/sessionAdded", 1)).toBeDefined();
+
+    const res = await disposeSession(h, 1, sessionChannelURI("ses_disp"), 400);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    expect(h.facade.removeCalls).toEqual(["ses_disp"]);
+
+    // root/sessionRemoved (exactly once) and the active-session count at 0.
+    expect(h.frames.filter((f) => f.message.method === "root/sessionRemoved")).toHaveLength(1);
+    const removed = h.notification("root/sessionRemoved", 1)!;
+    expect(removed.params.session).toBe(sessionChannelURI("ses_disp"));
+    const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(0);
+
+    // The session channel is no longer subscribable; listSessions is empty.
+    const sub = await subscribe(h, 1, sessionChannelURI("ses_disp"), 401);
+    expect(sub.error?.code).toBe(ERROR_SESSION_NOT_FOUND);
+    const page = await listSessionsPage(h, 402);
+    expect(page.items).toHaveLength(0);
+
+    // The backend's session.deleted (pushed by the fake during the remove,
+    // possibly pumped before or after the unbind) must not re-run the
+    // teardown: no duplicate root/sessionRemoved, no resurfacing.
+    await new Promise((r) => setTimeout(r, 320));
+    expect(h.frames.filter((f) => f.message.method === "root/sessionRemoved")).toHaveLength(1);
+    expect(h.frames.filter((f) => f.message.method === "root/sessionAdded")).toHaveLength(1);
+
+    // A second dispose (or one that raced a TUI deletion) is an error.
+    const again = await disposeSession(h, 1, sessionChannelURI("ses_disp"), 403);
+    expect(again.error?.code).toBe(ERROR_SESSION_NOT_FOUND);
+    h.stop();
+  }, 10000);
+
+  it("disposes a multi-chat session: every peer backend goes with the record", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const defaultSession = await setupSession(h, "dm-sess");
+    const peer = "ahp-chat:/peer-dm";
+    await createChat(h, 1, { channel: sessionChannelURI("dm-sess"), chat: peer }, 410);
+    const peerSession = h.facade.createdIds[1]!;
+
+    const res = await disposeSession(h, 1, sessionChannelURI("dm-sess"), 411);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    // Every opencode backend behind the record is removed (default + peer).
+    expect(h.facade.removeCalls).toHaveLength(2);
+    expect(h.facade.removeCalls).toContain(defaultSession);
+    expect(h.facade.removeCalls).toContain(peerSession);
+
+    expect(h.notification("root/sessionRemoved", 1)).toBeDefined();
+    const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(0);
+
+    // Neither the session channel nor the peer chat channel is subscribable.
+    const sub = await subscribe(h, 1, sessionChannelURI("dm-sess"), 412);
+    expect(sub.error?.code).toBe(ERROR_SESSION_NOT_FOUND);
+    const chatSub = await subscribe(h, 1, peer, 413);
+    expect(chatSub.error?.code).toBe(ERROR_SESSION_NOT_FOUND);
+
+    // No disposed backend resurfaces as its own AHP session past the
+    // grace window (the peer's session.deleted must not re-attach or
+    // re-register anything).
+    await new Promise((r) => setTimeout(r, 320));
+    expect(h.frames.filter((f) => f.message.method === "root/sessionAdded")).toHaveLength(1);
+    h.stop();
+  }, 10000);
+
+  it("accepts the legacy <scheme>:/<suffix> channel form (the one clients echo back)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const legacy = "gpuz:/legacy-disp";
+    const created = await createSession(h, 1, legacy, { provider: "gpuz" });
+    expect(created.error).toBeUndefined();
+    const backend = h.facade.createdIds[0]!;
+
+    const res = await disposeSession(h, 1, legacy, 420);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    expect(h.facade.removeCalls).toEqual([backend]);
+    const removed = h.notification("root/sessionRemoved", 1)!;
+    expect(removed.params.session).toBe(legacy);
+    h.stop();
+  });
+
+  it("rejects non-session channels and unknown sessions without side effects", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await setupSession(h, "ej-sess");
+
+    const chat = await disposeSession(h, 1, chatChannelURI("ej-sess"), 430);
+    expect(chat.error?.code).toBe(ERROR_INVALID_PARAMS);
+    const root = await disposeSession(h, 1, ROOT_CHANNEL, 431);
+    expect(root.error?.code).toBe(ERROR_INVALID_PARAMS);
+    const unknown = await disposeSession(h, 1, sessionChannelURI("ghost"), 432);
+    expect(unknown.error?.code).toBe(ERROR_SESSION_NOT_FOUND);
+
+    // The session is untouched.
+    expect(h.notification("root/sessionRemoved", 1)).toBeUndefined();
+    expect(h.facade.removeCalls).toHaveLength(0);
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ej-sess"), 433);
+    expect(sess.chats).toHaveLength(1);
     h.stop();
   });
 });

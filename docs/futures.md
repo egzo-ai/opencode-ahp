@@ -316,7 +316,6 @@ back it.
 | Command | Status | opencode backing | Notes |
 | --- | --- | --- | --- |
 | `fetchTurns` | not implemented | **yes** — `ctx.session.context` | Turn history hydration; [§1.3](#13-turn-history-hydration-fetchturns). |
-| `disposeSession` | not implemented | **yes** — `ctx.session.remove` (already used by `disposeChat`) | Pure host-side work. Careful with multi-chat: one session may back several chats — disposal must handle the peer bindings. |
 | `moveChat` | not implemented | no — no session fork/copy API; a chat is 1:1 with its opencode backend session | 1.1.0-in-flight companion action `chat/moved` ([§3.2](#32-what-is-in-flight-on-upstream-main)); VS Code 1.145.2 does not call it. |
 | `completions` | not implemented | **partially** — `ctx.experimental.generate` (stateless model generation) | A mapping is implementable today; no client in the field drives it against this host. |
 | `sessionConfigCompletions` | **intentionally unreachable** | n/a — `resolveSessionConfig` answers an empty schema | The client-side guard ("property not advertised") makes the command unreachable; never advertise what we don't implement. |
