@@ -139,6 +139,15 @@ export interface FacadeSession {
   archived?: boolean;
   time: { created: number; updated: number };
   /**
+   * The opencode session this one is a child of — set only for
+   * subagent children (opencode core creates them with a `parentID`
+   * pointing at the caller's session). Root sessions and forks carry
+   * no parentID (a fork records its origin in `fork` instead). The
+   * host never surfaces a parented session as an AHP session
+   * (mirrors the TUI's session-list filter).
+   */
+  parentID?: string;
+  /**
    * Durable, core-opaque session metadata. The host uses
    * one key — `opencode-ahp` — to make the peer-chat binding survive a
    * restart; everything else is passed through opaquely.
@@ -165,10 +174,31 @@ export type FacadePermissionDecision = "once" | "reject";
  * wire shape; everything downstream works on this union.
  */
 export type FacadeEvent =
-  | { type: "session.created"; sessionID: string; title?: string; agent?: string; model?: FacadeModelRef }
+  | {
+      type: "session.created";
+      sessionID: string;
+      title?: string;
+      agent?: string;
+      model?: FacadeModelRef;
+      /** The parent session id (subagent children); absent for root sessions and forks. */
+      parentID?: string;
+    }
   | { type: "session.deleted"; sessionID: string }
   | { type: "session.renamed"; sessionID: string; title: string }
-  | { type: "inbox.enqueued"; sessionID: string; inboxID: string; text: string; delivery: FacadeDelivery | "default" }
+  | {
+      type: "inbox.enqueued";
+      sessionID: string;
+      inboxID: string;
+      text: string;
+      delivery: FacadeDelivery | "default";
+      /**
+       * The enqueued item is a subagent completion report (a synthetic
+       * item whose `payload.metadata.source` is `"subagent"` — opencode
+       * core's report-back for an idle child). The host origins a
+       * report-driven turn as a system notification, not user input.
+       */
+      subagent?: true;
+    }
   | { type: "inbox.delivered"; sessionID: string; inboxID: string }
   | { type: "execution.started"; sessionID: string }
   | { type: "execution.succeeded"; sessionID: string }
@@ -815,6 +845,7 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
           title: str(data["title"]),
           agent: str(data["agent"]),
           model: mapModelRef(data["model"]),
+          parentID: str(data["parentID"]),
         },
       };
     case "session.deleted":
@@ -832,6 +863,12 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
       if (inboxID === undefined || text === undefined)
         return drop(missingOf({ inboxID, text }));
       const delivery = str(data["delivery"]) ?? str(item?.["delivery"]);
+      // Subagent completion report: a SYNTHETIC item tagged
+      // `metadata.source: "subagent"` (opencode core's report-back for an
+      // idle child). The item type is part of the detection key — user
+      // items may carry arbitrary metadata too.
+      const metadata = payload !== undefined && isObj(payload["metadata"]) ? payload["metadata"] : undefined;
+      const subagent = item?.["type"] === "synthetic" && metadata !== undefined && metadata["source"] === "subagent";
       return {
         status: "ok",
         event: {
@@ -840,6 +877,7 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
           inboxID,
           text,
           delivery: delivery === "steer" || delivery === "queue" ? delivery : "default",
+          ...(subagent ? { subagent: true as const } : {}),
         },
       };
     }
@@ -1196,6 +1234,16 @@ export function userMessage(text: string, model?: string, agentUri?: string): Me
   if (model !== undefined) message.model = { id: model };
   if (agentUri !== undefined) message.agent = { uri: agentUri };
   return message;
+}
+
+/**
+ * The system-notification-origin AHP `Message` for a machine-generated
+ * turn input — a subagent completion report waking an idle parent
+ * (design §8): the turn carries the report text verbatim, but its origin
+ * is `systemNotification`, not user input.
+ */
+export function systemNotificationMessage(text: string): Message {
+  return { text, origin: { kind: MessageKind.SystemNotification } };
 }
 
 /** Bitmask covering the mutually-exclusive activity bits (bits 0–4). */

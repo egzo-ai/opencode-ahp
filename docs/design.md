@@ -482,6 +482,17 @@ resurfacing after a location reload) become AHP sessions in two ways:
 2. **`listSessions`** — every listed opencode session is lazily
    registered (idempotent), which is how sessions survive a restart.
 
+A subagent child never becomes an AHP session, on either path. Opencode
+core creates a subagent child with a `parentID` pointing at the caller's
+session, and the host skips parented sessions: the pump drops a
+`session.created` carrying a `parentID` before the grace deferral, and
+`registerExternal` — the single seam behind both paths — returns without
+registering, so a child gets no record, no channel, and no root
+announcement. This mirrors opencode's own TUI, whose session list
+filters on `parentID`. Forks are not children — a fork records its
+origin in a `fork` field and carries no `parentID` — and register
+normally.
+
 Registration honors the durable **AHP markers** in opencode session
 metadata ([§15.2](#152-session-metadata-markers)):
 
@@ -815,10 +826,10 @@ exactly as written:
 
 | opencode event | AHP effect |
 | --- | --- |
-| `session.created` | deferred external registration ([§7.2](#72-external-sessions)). |
+| `session.created` | deferred external registration ([§7.2](#72-external-sessions)); a `parentID` in the event (a subagent child) skips it before the deferral. |
 | `session.deleted` | default chat → the record is removed (the same teardown `disposeSession` runs, then the backend removals; peers' backends disposed, terminals torn down, client tools failed); peer chat → `session/chatRemoved` for that chat only. |
 | `session.renamed` | default chat → `session/titleChanged`; peer chat → `session/chatUpdated` (chat summaries carry the title). |
-| `execution.started` | if the turn is not already claimed (client write-ahead), start an **orphan turn** seeded with the last-seen inbox message (external TUI prompts). |
+| `execution.started` | if the turn is not already claimed (client write-ahead), start an **orphan turn** seeded with the last-seen inbox message (external TUI prompts); when that message is a subagent completion report, the seed carries the report text verbatim under a `systemNotification` origin instead of as user input. |
 | `execution.succeeded` | `chat/turnComplete` (duration from the host clock) + `finishTurn`. |
 | `execution.failed` | `chat/error` with the error part + `finishTurn`. |
 | `execution.interrupted` | `chat/turnCancelled` + `finishTurn` — skipped when the client's own `chat/turnCancelled` echo already finalized the turn. |
@@ -832,7 +843,21 @@ exactly as written:
 | `usage.updated` | `chat/usage` (session-cumulative tokens; the chat reducer replaces the turn's usage, so the latest is the turn's view). |
 | `permission.asked` (tool-sourced) | `chat/toolCallReady` *without* `confirmed` → status *pending-confirmation*, plus a `toolConfirmation` input request on the session channel (the in-window approval prompt). Non-tool permissions have no AHP counterpart and are logged. |
 | `permission.replied` | safety net: removes the confirmation input request if the client's `chat/toolCallConfirmed` did not already. |
-| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; steering consumption happens at turn end. |
+| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; an enqueued synthetic item tagged `metadata.source: "subagent"` (a subagent completion report) is marked as such for the orphan-turn seeding; steering consumption happens at turn end. |
+
+**Subagent completion reports drive orphan turns.** When a subagent
+child goes idle, opencode admits its report to the parent's inbox as a
+synthetic `steer` item (a `<subagent …>` text blob) tagged
+`metadata.source: "subagent"` and wakes the parent. If the parent is
+idle, the wake promotes the pending steer into a new execution — the
+host sees `execution.started` with no write-ahead turn claimed and
+starts the orphan turn above, seeding the turn message with the report
+text verbatim under AHP's `systemNotification` message origin (the
+kind for machine-generated input). The turn is not suppressed: the
+parent model's response to the report must still reach the client, and
+the terminal actions drop any turn whose id the host never claimed. If
+the parent is mid-turn, the steer is consumed at a step boundary of the
+running turn and no orphan turn starts.
 
 `finishTurn` (after any turn terminal) clears the steering message the
 turn consumed (`chat/pendingMessageRemoved`), auto-starts the next turn
@@ -1305,6 +1330,17 @@ unit test pins the force flag). The teardown logs a
 single line — a torn-down listener with no log line is otherwise
 undiagnosable.
 
+The cleanup runs as a finalizer in the location's activation scope —
+opencode closes it on unload and on a plugin swap — so it must not
+throw: on the 2.2.6 peer floor a failing finalizer aborts the whole
+plugin swap, leaving the config-derived agents and commands
+unregistered until the next reload (opencode 2.3.x isolates a failing
+finalizer to a log line). The cleanup is therefore per-step guarded: a
+failing step is logged and the remaining steps still run, with the
+listener stop — the step that releases the port — unconditional and
+last. The same guard covers the `Bun.serve` failure path, whose
+half-started listener must stop without throwing out of `setup` (R2).
+
 ## 14. Error handling & graceful degradation
 
 The governing rule (R2): **the opencode server must stay up**. The
@@ -1332,6 +1368,7 @@ never opencode.
 | `disposeSession` backend-removal failure | The AHP session is dropped anyway; the lingering opencode session shows in the TUI (and lazily in `listSessions`) until deleted there. |
 | pty spawn failure (`createTerminal`) | Logged; the command answers `-32603`; the host keeps serving (R2). |
 | pty kill failure (dispose / teardown) | Logged; the record and registry entry are dropped anyway. |
+| Teardown step failure | Logged; the remaining steps still run — the listener stop (the port release) is unconditional and last. |
 
 The JSON-RPC error code table used by the host:
 

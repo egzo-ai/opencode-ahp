@@ -626,6 +626,13 @@ describe("mapV2Event", () => {
       expect(ev?.type === "session.created" && ev.title).toBeUndefined();
       expect(ev?.type === "session.created" && ev.agent).toBeUndefined();
       expect(ev?.type === "session.created" && ev.model).toBeUndefined();
+      expect(ev?.type === "session.created" && ev.parentID).toBeUndefined();
+    });
+
+    it("maps session.created's parentID (a subagent child)", () => {
+      expect(
+        mapV2Event(v2("session.created", { parentID: "ses_parent" })),
+      ).toEqual({ type: "session.created", sessionID: "ses_test", parentID: "ses_parent" });
     });
 
     it("maps session.deleted", () => {
@@ -662,6 +669,50 @@ describe("mapV2Event", () => {
         text: "hello",
         delivery: "steer",
       });
+    });
+
+    it("marks inbox.enqueued as a subagent report when the synthetic item is tagged", () => {
+      const ev = mapV2Event(
+        v2("session.inbox.enqueued", {
+          inboxID: "msg_sub",
+          item: {
+            type: "synthetic",
+            payload: {
+              text: '<subagent sessionID="ses_child" state="completed" description="Explore">\nresult\n</subagent>',
+              metadata: { source: "subagent", childID: "ses_child", agent: "explore", state: "completed" },
+            },
+            delivery: "steer",
+          },
+        }),
+      );
+      expect(ev).toEqual({
+        type: "inbox.enqueued",
+        sessionID: "ses_test",
+        inboxID: "msg_sub",
+        text: '<subagent sessionID="ses_child" state="completed" description="Explore">\nresult\n</subagent>',
+        delivery: "steer",
+        subagent: true,
+      });
+    });
+
+    it("does not mark other enqueued items as subagent reports", () => {
+      const user = mapV2Event(
+        v2("session.inbox.enqueued", {
+          inboxID: "msg_u",
+          item: { type: "user", payload: { text: "hello", metadata: { source: "subagent" } }, delivery: "queue" },
+        }),
+      );
+      // The tag is read from the synthetic payload; a user item's metadata
+      // does not mark it.
+      expect(user?.type === "inbox.enqueued" && user.subagent).toBeUndefined();
+
+      const untagged = mapV2Event(
+        v2("session.inbox.enqueued", {
+          inboxID: "msg_s",
+          item: { type: "synthetic", payload: { text: "note" }, delivery: "steer" },
+        }),
+      );
+      expect(untagged?.type === "inbox.enqueued" && untagged.subagent).toBeUndefined();
     });
 
     it("falls back to the item's delivery, then to default", () => {

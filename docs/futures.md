@@ -537,7 +537,10 @@ Ordered by impact. Findings verified against v2.2.6 source and current
    delivers (v2.2.6); adding it would let the host re-push
    `serverTools` when an MCP server adds or removes tools
    ([§1.6](#16-live-re-push-of-the-session-customization-catalog)).
-   Long-term; no current client need.
+   Long-term; no current client need. Note: opencode 2.3.x has since
+   shipped a draft MCP Events extension (`experimental.mcp.event`, a
+   per-server subscription) on the public inventory — the likely
+   successor to this request; [§4.3](#43-opencode-23x--the-delta-the-host-is-compatible-with).
 10. **Per-MCP-server configuration provenance** — the MCP status list
    a plugin can see is name, title, and status: no config file, no
    key path. The host therefore anchors every `McpServerCustomization`
@@ -592,6 +595,50 @@ command requirements (§6).
   protocol surface (resource watches, `root/progress`, automations,
   elicitations) — each becomes a candidate for host support in the
   priority order of [§2](#2-the-ahp-100-surface-the-host-does-not-implement).
+
+### 4.3 opencode 2.3.x — the delta the host is compatible with
+
+The plugin's `@opencode/plugin` peer floor is `^2.2.6`, so the 2.3.x
+line it now runs against (2.3.2) is in range. The 2.2.6 → 2.3.2 delta
+is additive for the host: nothing it calls through `ctx.*` changed in a
+breaking way, and the new wire events are dropped as unimplemented
+(graceful). The items below are the parts of the delta worth recording —
+the ones with a future host mapping, or an upstream watch — not a
+per-file changelog. Verified against opencode 2.3.2 source.
+
+- **New manifest events.** `session.step.first-token` (durable; a
+  first-token latency marker) and `experimental.mcp.event` (ephemeral;
+  one event from an MCP Events subscription). The host drops both as
+  unimplemented today. `session.step.first-token` has no direct AHP
+  1.0.0 slot — mapping it would need a new chat/turn part — so it stays
+  a candidate, not a gap any client hits. `experimental.mcp.event` is
+  the watch below.
+- **MCP Events (draft extension).** opencode 2.3.x ships a draft "MCP
+  Events" surface: a per-server subscription (`pending` → `active` →
+  `ended`) and the `experimental.mcp.event` event, now on the public
+  `EventManifest.Server` inventory a plugin's event subscription
+  delivers. This is upstream's new mechanism for MCP change
+  notifications — the likely successor to the `mcp.tools.changed`
+  request in [§4.1](#41-opencode--feature-requests-to-file) item 9 (and
+  the MCP-change half of [§1.6](#16-live-re-push-of-the-session-customization-catalog)).
+  It is a draft with no compatibility guarantee, and it changes the
+  shape of the request (a subscription + event stream rather than a
+  single `tools.changed` event). Watch it and re-point item 9 / §1.6
+  toward it once it stabilizes. No host work until then — AHP 1.0.0
+  still has no slot for MCP resource-change state, and the event is
+  live-only.
+- **New hook surface, unused.** `SessionHooks.fork` (a `{ sessionID }`
+  hook fired on a session fork) and the `packages/plugin/src/gui` (GUI
+  plugin) surface are new/expanded in 2.3.x. The host is a headless
+  plugin that drives `ctx.session.*` directly and ships no GUI, so
+  neither is applicable today; noted so a fork-aware host (or a GUI
+  front-end) has the seam located.
+
+A few more additive items sit on opencode `main` (32 commits past 2.3.2)
+that are not yet in a release and are not tracked here individually —
+`experimental.model.resolve`, `SessionRequestMessage.metadata`, and a
+`codemode` idle-background kind, among them. They will be re-assessed
+when they land in a release the peer range covers.
 
 ---
 

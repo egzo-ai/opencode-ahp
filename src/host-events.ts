@@ -4,7 +4,7 @@
 
 import { HostDispatch } from "./host-dispatch.js";
 import { ActionType, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
-import { displayNameFor, pastTenseMessageFor, userMessage, FacadeEvent } from "./bridge.js";
+import { displayNameFor, pastTenseMessageFor, systemNotificationMessage, userMessage, FacadeEvent } from "./bridge.js";
 import { EXTERNAL_REGISTER_GRACE_MS, errorMessage, mapToolResultContent } from "./host-util.js";
 
 export class HostEvents extends HostDispatch {
@@ -42,6 +42,10 @@ export class HostEvents extends HostDispatch {
   // ── opencode event pump handlers ───────────────────────────────────────
   private async handleEvent(ev: FacadeEvent): Promise<void> {
     if (ev.type === "session.created") {
+      // Subagent children (a `parentID` in the created event) never
+      // surface as AHP sessions — skip them before the deferral so no
+      // grace timer or existence fetch runs for them (design §7.2).
+      if (ev.parentID !== undefined) return;
       // Every live chat has its own opencode session, so a
       // created event for an already-bound id is ours (a createChat
       // backend) and never an external session.
@@ -93,7 +97,11 @@ export class HostEvents extends HostDispatch {
         }
         return;
       case "inbox.enqueued":
-        chat.lastInbox = { text: ev.text, delivery: ev.delivery };
+        chat.lastInbox = {
+          text: ev.text,
+          delivery: ev.delivery,
+          ...(ev.subagent !== undefined ? { subagent: true } : {}),
+        };
         return;
       case "inbox.delivered":
         // Steering consumption is handled at turn end (finishTurn).
@@ -101,8 +109,20 @@ export class HostEvents extends HostDispatch {
       case "execution.started":
         if (chat.currentTurnId !== null) return; // write-ahead already claimed the turn
         // Orphan turn (an external TUI prompt, or a handoff this host did
-        // not initiate): start it with the last-seen inbox message.
-        this.startTurn(chat, chat.lastInbox !== null ? userMessage(chat.lastInbox.text) : userMessage(""));
+        // not initiate): start it with the last-seen inbox message. A
+        // subagent completion report waking an idle parent is
+        // machine-generated input, not a user prompt — the turn message
+        // carries the report text verbatim under a system-notification
+        // origin (design §8).
+        const inbox = chat.lastInbox;
+        this.startTurn(
+          chat,
+          inbox === null
+            ? userMessage("")
+            : inbox.subagent
+              ? systemNotificationMessage(inbox.text)
+              : userMessage(inbox.text),
+        );
         return;
       case "execution.succeeded":
         if (chat.currentTurnId === null) return;

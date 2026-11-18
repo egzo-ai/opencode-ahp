@@ -1078,6 +1078,30 @@ describe("listSessions", () => {
     expect(page.items[0].resource).toBe(sessionChannelURI("mine"));
     h.stop();
   });
+
+  it("does not surface subagent child sessions (a parentID) and keeps their channel unregistered", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const t0 = Date.now() - 5000;
+    h.facade.sessions.set("ses_parent", { sessionID: "ses_parent", title: "Parent", time: { created: t0, updated: t0 } });
+    h.facade.sessions.set("ses_child", {
+      sessionID: "ses_child",
+      title: "Subagent child",
+      parentID: "ses_parent",
+      time: { created: t0, updated: t0 + 1000 },
+    });
+
+    h.send(1, "listSessions", {}, 211);
+    await waitFor(() => h.frames.some((f) => f.message.id === 211), "list");
+    const page = h.frames.find((f) => f.message.id === 211)!.message.result;
+    expect(page.items.map((s: Record<string, any>) => s.resource)).toEqual([sessionChannelURI("ses_parent")]);
+
+    // The child's channel was never registered — no lazy registration either.
+    const sub = await subscribe(h, 1, sessionChannelURI("ses_child"), 212);
+    expect(sub.error?.code).toBe(-32001);
+    h.stop();
+  });
 });
 
 // ── turn lifecycle (fixture replay) ───────────────────────────────────────
@@ -1224,6 +1248,38 @@ describe("turn lifecycle", () => {
     const started = await waitForAction(h, chatURI, "chat/turnStarted");
     expect(started.origin).toBeUndefined();
     expect(started.action.message.text).toBe("from the TUI");
+    h.stop();
+  });
+
+  it("an idle subagent report starts a host-minted turn with a system-notification origin", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const ses = "ses_t4";
+    await createSession(h, 1, sessionChannelURI(ses), { provider: "gpuz" });
+    const chatURI = chatChannelURI(ses);
+    await subscribe(h, 1, chatURI, 102);
+
+    const report =
+      '<subagent sessionID="ses_child" state="completed" description="Explore">\nresult text\n</subagent>';
+    h.facade.push({
+      type: "inbox.enqueued",
+      sessionID: ses,
+      inboxID: "m2",
+      text: report,
+      delivery: "steer",
+      subagent: true,
+    });
+    h.facade.push({ type: "execution.started", sessionID: ses });
+    const started = await waitForAction(h, chatURI, "chat/turnStarted");
+    // The report text is carried verbatim (it is the turn's actual input),
+    // but its origin is a system notification, not user input.
+    expect(started.action.message.text).toBe(report);
+    expect(started.action.message.origin).toEqual({ kind: "systemNotification" });
+
+    // The turn finalizes normally (the model's response is not dropped).
+    h.facade.push({ type: "execution.succeeded", sessionID: ses });
+    await waitForAction(h, chatURI, "chat/turnComplete");
     h.stop();
   });
 });
@@ -1960,6 +2016,27 @@ describe("external sessions", () => {
     await new Promise((r) => setTimeout(r, 320));
     expect(h.facade.getSessionsCalls).toContain("ses_gone");
     expect(h.notification("root/sessionAdded", 1)).toBeUndefined();
+    h.stop();
+  }, 10000);
+
+  it("never registers a subagent child (session.created with a parentID) — not even deferred", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.sessions.set("ses_child3", {
+      sessionID: "ses_child3",
+      title: "Subagent child",
+      parentID: "ses_parent3",
+      time: { created: Date.now(), updated: Date.now() },
+    });
+    h.facade.push({ type: "session.created", sessionID: "ses_child3", parentID: "ses_parent3", title: "Subagent child" });
+    // Past the 250 ms external-register grace: no registration ran, and
+    // the early skip means no existence fetch either.
+    await new Promise((r) => setTimeout(r, 320));
+    expect(h.facade.getSessionsCalls).not.toContain("ses_child3");
+    expect(h.notification("root/sessionAdded", 1)).toBeUndefined();
+    const sub = await subscribe(h, 1, sessionChannelURI("ses_child3"), 165);
+    expect(sub.error?.code).toBe(-32001);
     h.stop();
   }, 10000);
 

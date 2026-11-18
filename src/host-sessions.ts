@@ -565,6 +565,12 @@ export class HostSessions extends HostChats {
    * client, or a session resurfacing after a restart).
    * Outcomes:
    *
+   *  - the session has a parent (a subagent child — opencode core
+   *    creates children with a `parentID`) → skip (undefined): children
+   *    are internal to the parent's opencode session and never surface
+   *    as AHP sessions (mirrors the TUI's parentID session-list filter;
+   *    forks are not children — they carry no `parentID` — and register
+   *    normally);
    *  - the opencode id already backs a chat of a live record → skip
    *    (undefined); `listSessions` must not surface peer-chat backends
    *    as their own AHP sessions;
@@ -581,6 +587,11 @@ export class HostSessions extends HostChats {
    *    opencode id (the record).
    */
   private registerExternal(fs: FacadeSession): SessionRecord | undefined {
+    // Subagent children never surface (design §7.2): the single seam for
+    // every external-registration path (the event-pump deferral, the
+    // listSessions scan) — a skipped record gets no AHP session, no
+    // channel, and no root announcement.
+    if (fs.parentID !== undefined) return undefined;
     const existing = this.sessions.get(fs.sessionID);
     if (existing !== undefined) return existing;
     if (this.byOpencode.has(fs.sessionID)) return undefined;

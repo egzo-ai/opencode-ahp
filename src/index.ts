@@ -253,6 +253,10 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
     ...(info.title !== undefined && info.title !== null ? { title: String(info.title) } : {}),
     ...(info.agent !== undefined ? { agent: String(info.agent) } : {}),
     ...(info.model !== undefined ? { model: modelRefOf(info) } : {}),
+    // Subagent children carry their parent's opencode session id; root
+    // sessions and forks (which record their origin in `fork`) do not.
+    // The host never surfaces a parented session (mirrors the TUI filter).
+    ...(info.parentID !== undefined && info.parentID !== null ? { parentID: String(info.parentID) } : {}),
     // SessionInfo.time carries `archived` only while archived.
     ...(info.time.archived !== undefined ? { archived: true } : {}),
     // Durable, core-opaque metadata: the host reads its
@@ -1067,8 +1071,19 @@ export default Plugin.define({
       cleanupHost = () => {
         // Kill the pty terminals before the listener stops — their final
         // terminal/exited actions still reach subscribers while it is up.
-        host.stopTerminals();
-        host.stopEventPump();
+        // Per-step guards (design §13.4): a failing step is logged and
+        // must not skip the later ones — skipping the pump abort leaves
+        // the ctx.event.subscribe iteration running.
+        try {
+          host.stopTerminals();
+        } catch (e) {
+          console.error(`${TAG} location teardown: stopTerminals failed (${errorMessage(e)})`);
+        }
+        try {
+          host.stopEventPump();
+        } catch (e) {
+          console.error(`${TAG} location teardown: stopEventPump failed (${errorMessage(e)})`);
+        }
       };
       console.log(
         `${TAG} AHP 1.0.0 host listening on ws${opts.tls ? "s" : ""}://${opts.host}:${listener.port}${opts.path} ` +
@@ -1076,7 +1091,11 @@ export default Plugin.define({
       );
     } catch (e) {
       console.error(`${TAG} failed to start the AHP listener: ${errorMessage(e)}`);
-      listener?.stop();
+      try {
+        listener?.stop();
+      } catch (stopErr) {
+        console.error(`${TAG} failed to stop the half-started AHP listener: ${errorMessage(stopErr)}`);
+      }
       listener = null;
       return; // R2: the opencode server stays up without AHP
     }
@@ -1084,10 +1103,19 @@ export default Plugin.define({
     // 5. Cleanup: stop the pump (aborts the event subscription) and stop
     //    the listener, dropping every client connection. Logged because a
     //    torn-down listener with no log line is otherwise undiagnosable.
+    // Teardown runs as a finalizer in the location's activation scope
+    // (design §13.4): every step is individually guarded, and the
+    // listener stop — the step that releases the port — runs
+    // unconditionally and last, so an earlier failure can neither skip it
+    // nor throw out of the finalizer.
     return () => {
       console.log(`${TAG} location teardown — stopping the AHP host (location unloaded by opencode)`);
       cleanupHost?.();
-      listener?.stop();
+      try {
+        listener?.stop();
+      } catch (e) {
+        console.error(`${TAG} location teardown: listener stop failed (${errorMessage(e)})`);
+      }
     };
   },
 });

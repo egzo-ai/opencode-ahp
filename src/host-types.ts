@@ -70,8 +70,13 @@ export interface ChatRuntime {
    * `tool.input.started`, removed at the opencode-side terminal).
    */
   clientToolCalls: Map<string, ClientToolInvocation>;
-  /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
-  lastInbox: { text: string; delivery: string } | null;
+  /**
+   * The most recent `session.inbox.enqueued` (external/TUI prompt
+   * tracking). `subagent` marks a synthetic completion report — a
+   * report-driven orphan turn originates its message as a system
+   * notification, not user input (design §8).
+   */
+  lastInbox: { text: string; delivery: string; subagent?: true } | null;
   // ── changesets ────────────────────────────────────────────────
   /**
    * Live chat-owned changeset stores (uncommitted + turn), keyed by
