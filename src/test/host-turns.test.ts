@@ -551,3 +551,183 @@ describe("cancel and terminal events", () => {
     h.stop();
   });
 });
+
+// ── truncation ────────────────────────────────────────────────────────────
+// `chat/truncated` is state-only: the official reducer trims the stored
+// turns and drops the active turn (status → idle). opencode's message
+// history is untouched (no counterpart on the plugin surface) and an
+// in-flight execution is not interrupted — its late events land on a
+// store that no longer carries the turn (reducer no-ops).
+
+describe("truncation", () => {
+  const SES = "ses_trunc";
+  const dispatchTurn = (h: Harness, chatURI: string, seq: number, turnId: string, text: string) =>
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: seq,
+      action: { type: "chat/turnStarted", turnId, startedAt: new Date().toISOString(), message: { text, origin: { kind: "user" } } },
+    });
+  /** Dispatch turnStarted and drive it to completion (one prompt + one succeeded event). */
+  async function completeTurn(h: Harness, chatURI: string, seq: number, turnId: string, text: string): Promise<void> {
+    dispatchTurn(h, chatURI, seq, turnId, text);
+    await waitFor(() => h.facade.promptCalls.length === seq, `prompt ${turnId}`);
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete", (a) => a.action.turnId === turnId);
+  }
+
+  it("keeps turns up to and including the named turn", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    await completeTurn(h, chatURI, 1, "t1", "first");
+    await completeTurn(h, chatURI, 2, "t2", "second");
+    let chat = await chatSnapshotState(h, 1, chatURI, 110);
+    expect(chat.turns.map((t) => t.id)).toEqual(["t1", "t2"]);
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 3,
+      action: { type: "chat/truncated", turnId: "t1" },
+    });
+    const echo = await waitForAction(h, chatURI, "chat/truncated");
+    expect(echo.rejectionReason).toBeUndefined();
+    chat = await chatSnapshotState(h, 1, chatURI, 111);
+    expect(chat.turns.map((t) => t.id)).toEqual(["t1"]);
+    expect(chat.activeTurn).toBeUndefined();
+    expect(chat.status & (SessionStatus.InProgress | SessionStatus.InputNeeded)).toBe(0);
+    h.stop();
+  });
+
+  it("clears all turns when turnId is omitted", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    await completeTurn(h, chatURI, 1, "t1", "first");
+
+    h.send(1, "dispatchAction", { channel: chatURI, clientSeq: 2, action: { type: "chat/truncated" } });
+    const echo = await waitForAction(h, chatURI, "chat/truncated");
+    expect(echo.rejectionReason).toBeUndefined();
+    const chat = await chatSnapshotState(h, 1, chatURI, 112);
+    expect(chat.turns).toHaveLength(0);
+    expect(chat.activeTurn).toBeUndefined();
+    expect(chat.status & (SessionStatus.InProgress | SessionStatus.InputNeeded)).toBe(0);
+    h.stop();
+  });
+
+  it("drops an active turn (status → idle) without interrupting opencode", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    dispatchTurn(h, chatURI, 1, "t1", "go");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    let chat = await chatSnapshotState(h, 1, chatURI, 113);
+    expect(chat.activeTurn!.id).toBe("t1");
+
+    h.send(1, "dispatchAction", { channel: chatURI, clientSeq: 2, action: { type: "chat/truncated" } });
+    const echo = await waitForAction(h, chatURI, "chat/truncated");
+    expect(echo.rejectionReason).toBeUndefined();
+    chat = await chatSnapshotState(h, 1, chatURI, 114);
+    expect(chat.turns).toHaveLength(0);
+    expect(chat.activeTurn).toBeUndefined();
+    expect(chat.status & (SessionStatus.InProgress | SessionStatus.InputNeeded)).toBe(0);
+    expect(h.facade.interruptCalls).toHaveLength(0); // state-only: no interrupt
+
+    // The in-flight execution ends on the opencode side; its terminal
+    // event finds a store without the turn (reducer no-op) and the
+    // handoff runs against the post-truncation state.
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await new Promise((r) => setTimeout(r, 30));
+    chat = await chatSnapshotState(h, 1, chatURI, 115);
+    expect(chat.turns).toHaveLength(0);
+    expect(chat.activeTurn).toBeUndefined();
+    h.stop();
+  });
+
+  it("supports the documented use case: truncate, then turnStarted with the edited message", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    await completeTurn(h, chatURI, 1, "t1", "first");
+    await completeTurn(h, chatURI, 2, "t2", "second (to edit)");
+
+    // Truncate to t1, then resend the edited second message.
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 3,
+      action: { type: "chat/truncated", turnId: "t1" },
+    });
+    const echo = await waitForAction(h, chatURI, "chat/truncated");
+    expect(echo.rejectionReason).toBeUndefined();
+    dispatchTurn(h, chatURI, 4, "t3", "second (edited)");
+    await waitFor(() => h.facade.promptCalls.length === 3, "prompt t3");
+    expect(h.facade.promptCalls[2]).toEqual({ sessionID: SES, text: "second (edited)" });
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete", (a) => a.action.turnId === "t3");
+    const chat = await chatSnapshotState(h, 1, chatURI, 116);
+    expect(chat.turns.map((t) => t.id)).toEqual(["t1", "t3"]);
+    expect(chat.activeTurn).toBeUndefined();
+    h.stop();
+  });
+
+  it("accepts an unknown turnId (official reducer no-op, state unchanged)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    await completeTurn(h, chatURI, 1, "t1", "first");
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/truncated", turnId: "ghost" },
+    });
+    const echo = await waitForAction(h, chatURI, "chat/truncated");
+    expect(echo.rejectionReason).toBeUndefined();
+    const chat = await chatSnapshotState(h, 1, chatURI, 117);
+    expect(chat.turns.map((t) => t.id)).toEqual(["t1"]);
+    h.stop();
+  });
+
+  it("rejects an invalid turnId shape (non-string and empty)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", { channel: chatURI, clientSeq: 1, action: { type: "chat/truncated", turnId: 42 } });
+    const rejected = await waitForAction(h, chatURI, "chat/truncated", (a) => a.rejectionReason !== undefined && a.origin?.clientSeq === 1);
+    expect(rejected.rejectionReason).toMatch(/invalid chat\/truncated params/);
+    h.send(1, "dispatchAction", { channel: chatURI, clientSeq: 2, action: { type: "chat/truncated", turnId: "" } });
+    const rejected2 = await waitForAction(h, chatURI, "chat/truncated", (a) => a.rejectionReason !== undefined && a.origin?.clientSeq === 2);
+    expect(rejected2.rejectionReason).toMatch(/non-empty string/);
+    h.stop();
+  });
+
+  it("rejects a chat action on a session channel", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const sessURI = sessionChannelURI(SES);
+    await subscribe(h, 1, sessURI, 101);
+    h.send(1, "dispatchAction", { channel: sessURI, clientSeq: 1, action: { type: "chat/truncated" } });
+    const rejected = await waitForAction(h, sessURI, "chat/truncated", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/chat actions require a chat channel/);
+    h.stop();
+  });
+});

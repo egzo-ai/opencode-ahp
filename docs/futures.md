@@ -187,12 +187,6 @@ becomes worth doing only once that happens.
   narrows it out for now. This is a **protocol-side watch**: if AHP
   adds a reply mode (or confirmation-option id), the host can map it to
   opencode's `always` decision.
-- **`chat/truncated`** — client-dispatchable and **state-only** (records
-  a client-side turn truncation in the reduced state); no opencode
-  dependency. The one micro-improvement here with **no blocker** —
-  accept it through the official reducer instead of the current
-  rejection echo. Potential, not planned: it is small, and nothing
-  currently demands it.
 
 ### 1.5 Multiroot sessions (`multipleWorkingDirectories`)
 
@@ -351,7 +345,6 @@ back it.
   cannot be resumed).
 - `queuedMessagesReordered` — reorder queued messages; no inbox
   reordering API in opencode.
-- `truncated` — state-only; **cheap win** ([§1.4](#14-small-chat-surface-gaps)).
 - `workingDirectorySet` / `workingDirectoryRemoved` — multiroot working
   directories; the host advertises no `multipleWorkingDirectories`
   capability (a location is one directory), so conformant clients never

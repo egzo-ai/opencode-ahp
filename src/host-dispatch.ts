@@ -3,7 +3,7 @@
  */
 
 import { HostSessions } from "./host-sessions.js";
-import { ActionType, SessionInputRequestKind, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
+import { ActionType, SessionInputRequestKind, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTruncatedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
 import { FacadeDelivery, MCP_CUSTOMIZATION_ID_PREFIX } from "./bridge.js";
 import { normalizeToolDefinitions } from "./client-tools.js";
 import { channelKind, parseChangesetChannel } from "./channels.js";
@@ -142,6 +142,10 @@ export class HostDispatch extends HostSessions {
       case ActionType.ChatTurnCancelled:
         if (chat === undefined) { noChat(); return; }
         await this.dispatchTurnCancelled(chat, stateAction, origin);
+        return;
+      case ActionType.ChatTruncated:
+        if (chat === undefined) { noChat(); return; }
+        this.dispatchTruncated(chat, stateAction, origin);
         return;
       case ActionType.SessionTitleChanged:
         await this.dispatchTitleChanged(rec, stateAction, origin);
@@ -572,6 +576,28 @@ export class HostDispatch extends HostSessions {
     // turn after the echo finalized it (skipped); run the queued/steering
     // handoff now, on the host side.
     await this.finishTurn(chat);
+  }
+
+  /**
+   * `chat/truncated` (client-dispatchable): the client trims the chat's
+   * turn history in the shared state (the documented use case: truncate,
+   * then dispatch a new `chat/turnStarted` with an edited message).
+   * State-only on this host — the official reducer trims the stored turns
+   * (to and including `turnId`, or to none when it is omitted) and drops
+   * the active turn (status → idle); opencode's message history has no
+   * counterpart and is untouched, and an in-flight execution is not
+   * interrupted: its late events land on a store that no longer carries
+   * the turn, and the reducer no-ops them. An unknown `turnId` follows
+   * the official reducer's no-op (accepted, state unchanged).
+   */
+  private dispatchTruncated(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): void {
+    const chatURI = chat.uri;
+    const a = action as ChatTruncatedAction;
+    if (a.turnId !== undefined && (typeof a.turnId !== "string" || a.turnId.length === 0)) {
+      this.echo(chatURI, action, origin, "invalid chat/truncated params (turnId must be a non-empty string)");
+      return;
+    }
+    this.echo(chatURI, action, origin);
   }
 
   /**
