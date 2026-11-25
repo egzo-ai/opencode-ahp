@@ -11,6 +11,14 @@ import { isRecord } from "./options.js";
 import { RpcMessage, ChatRuntime, SessionRecord } from "./host-types.js";
 import { errorMessage, normalizeToolCallResult, clientResultToFacade } from "./host-util.js";
 
+/**
+ * The cap on a client-supplied title (UTF-16 code units). AHP sets no
+ * limit and opencode persists titles untruncated, so without it a client
+ * can bloat the session catalog, the session store, and every `action`
+ * echo to the channel's subscribers with an arbitrarily long title.
+ */
+const MAX_TITLE_LENGTH = 256;
+
 export class HostDispatch extends HostSessions {
   /**
    * `dispatchAction` is a notification — the response is the `action`
@@ -626,6 +634,10 @@ export class HostDispatch extends HostSessions {
     const title = typeof a.title === "string" && a.title.length > 0 ? a.title : null;
     if (title === null) {
       this.echo(channel, action, origin, "invalid session/titleChanged params");
+      return;
+    }
+    if (title.length > MAX_TITLE_LENGTH) {
+      this.echo(channel, action, origin, `title too long: ${title.length} characters (max ${MAX_TITLE_LENGTH})`);
       return;
     }
     const chat = rec.chats.get(channel);

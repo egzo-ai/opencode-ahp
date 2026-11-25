@@ -82,6 +82,70 @@ describe("session-level actions", () => {
     h.stop();
   });
 
+  it("rejects a title over 256 characters without renaming the backend", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const session = sessionChannelURI(SES);
+    await createSession(h, 1, session, { provider: "gpuz" });
+    await subscribe(h, 1, session, 154);
+    h.send(1, "dispatchAction", {
+      channel: session,
+      clientSeq: 1,
+      action: { type: "session/titleChanged", title: "x".repeat(257) },
+    });
+    const echo = await waitForAction(h, session, "session/titleChanged", (a) => a.rejectionReason !== undefined);
+    expect(echo.rejectionReason).toBe("title too long: 257 characters (max 256)");
+    expect(h.facade.renameCalls).toEqual([]);
+    const state = await sessionSnapshotState(h, 1, session, 155);
+    expect(state.title).toBe("New Session");
+    h.stop();
+  });
+
+  it("accepts a title of exactly 256 characters (the limit is inclusive)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const session = sessionChannelURI(SES);
+    await createSession(h, 1, session, { provider: "gpuz" });
+    await subscribe(h, 1, session, 156);
+    const title = "x".repeat(256);
+    h.send(1, "dispatchAction", {
+      channel: session,
+      clientSeq: 1,
+      action: { type: "session/titleChanged", title },
+    });
+    await waitFor(() => h.facade.renameCalls.length === 1, "rename");
+    expect(h.facade.renameCalls[0]).toEqual({ sessionID: SES, title });
+    const echo = await waitForAction(h, session, "session/titleChanged");
+    expect(echo.rejectionReason).toBeUndefined();
+    const state = await sessionSnapshotState(h, 1, session, 157);
+    expect(state.title).toBe(title);
+    h.stop();
+  });
+
+  it("rejects an over-limit chat rename without renaming the peer backend", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const session = sessionChannelURI(SES);
+    const chat = "ahp-chat:/peer-rename";
+    await createSession(h, 1, session, { provider: "gpuz" });
+    await createChat(h, 1, { channel: session, chat }, 151);
+    await subscribe(h, 1, chat, 152);
+    h.send(1, "dispatchAction", {
+      channel: chat,
+      clientSeq: 1,
+      action: { type: "session/titleChanged", title: "y".repeat(257) },
+    });
+    const echo = await waitForAction(h, chat, "session/titleChanged", (a) => a.rejectionReason !== undefined);
+    expect(echo.rejectionReason).toBe("title too long: 257 characters (max 256)");
+    expect(h.facade.renameCalls).toEqual([]);
+    const state = await sessionSnapshotState(h, 1, session, 158);
+    expect(state.chats.find((entry) => entry.resource === chat)?.title).toBe("Chat 2");
+    h.stop();
+  });
+
   it("echoes draft/read/archive actions without side effects", async () => {
     const h = makeHarness();
     h.init(1, "c1");
