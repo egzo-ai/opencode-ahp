@@ -97,7 +97,8 @@ server. Recapture it whenever opencode's event catalog changes shape.
 - CI (`.github/workflows/ci.yml`) runs on every push to `main` and on
   pull requests: `jdx/mise-action@v5` → `pnpm install --frozen-lockfile`
   → `pnpm typecheck` → `pnpm test`. Publishing (the trusted-publisher
-  workflow on push) runs the same pair first via `prepublishOnly`.
+  workflow, daily schedule or manual trigger) runs the same pair first via
+   `prepublishOnly`.
 - Gotcha: when piping `tsc` output (e.g. through `head`), set
   `set -o pipefail` first — otherwise the pipe masks `tsc`'s exit code
   and a broken build looks clean.
@@ -518,5 +519,5 @@ dependency.
 | Any code change (required before work is complete) | §1 `pnpm test` + §2 `pnpm typecheck` — both green, root-caused, never skipped. |
 | Live-behavior change (transport, host) — before asking the user to publish | §3 test server + `ahp-turn-lifecycle.mjs` minimum, plus the script dedicated to the changed surface. |
 | opencode event-catalog change | §3 `capture-events.mjs` to refresh `src/test/fixtures/events.jsonl`, then §1. |
-| Publish (user's push; CI trusted publisher) | §2 re-runs in CI; `prepublishOnly` runs the same pair first. |
+| Release (daily schedule or manual trigger; CI trusted publisher) | §2 re-runs in CI; `prepublishOnly` runs the same pair first. |
 | Conformance gate | §5 — re-run on new capabilities, pin changes, or corpus moves (§5.5). |

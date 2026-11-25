@@ -32,13 +32,15 @@ testing: `docs/testing.md`).
   verification is done manually against the LAN test server via
   `scripts/ahp-client.mjs` (handshake/probe) and
   `scripts/ahp-turn-lifecycle.mjs` (full turn lifecycle).
-- **Publishing**: CI only — push to GitHub and the trusted-publisher
-  workflow (`.github/workflows/publish.yml`) publishes
-  `0.1.<GITHUB_RUN_NUMBER>` (gaps in run numbers are expected) and creates
+- **Publishing**: CI only — the trusted-publisher workflow
+  (`.github/workflows/release.yml`) runs on a daily schedule
+  (09:00 America/Denver) and on manual trigger; a release guard skips the
+  run when nothing has merged since the last release tag. It publishes
+  `1.0.<GITHUB_RUN_NUMBER>` (gaps in run numbers are expected) and creates
   a tagged GitHub release (`v<version>`) with a short install pointer +
-  the push's commit list. `prepublishOnly` runs typecheck + tests as a
-  guard. Do not run `npm publish` from a shell (interactive 2FA blocks it;
-  the user's terminal is the only other path).
+  the commits since the previous release. `prepublishOnly` runs typecheck
+  + tests as a guard. Do not run `npm publish` from a shell (interactive
+  2FA blocks it; the user's terminal is the only other path).
 
 ## Critical Patterns
 
@@ -85,8 +87,9 @@ testing: `docs/testing.md`).
   run `git commit`, `git push`, `git tag`, `git rebase`, or any other
   history-mutating git command. Prepare the working tree (stage nothing
   required — just make the changes), then tell the user exactly what to
-  commit and push. Publishing rides on the push (CI trusted publisher), so
-  "ready to publish" = "working tree complete, user pushes".
+  commit and push. Releases ride on the workflow's daily schedule (or a
+  manual trigger), not on the push itself, so "ready to release" =
+  "working tree complete, user pushes".
 - `npm publish` is user-run only as well (interactive 2FA); CI is the normal
   publish path.
 

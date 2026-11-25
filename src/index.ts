@@ -122,7 +122,7 @@ function pluginVersion(): string {
   } catch {
     // fall through to the fallback
   }
-  return "0.1.1";
+  return "1.0.0";
 }
 
 /**

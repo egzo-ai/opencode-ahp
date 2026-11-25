@@ -345,11 +345,18 @@ this repo requires it.
 
 The published package is [`opencode-ahp` on npm](https://www.npmjs.com/package/opencode-ahp).
 
-Publishing is CI-only: push to `main` → CI (`typecheck` + `test`) → the
-publish workflow computes the version as `<major>.<minor>.<run-number>`
-and `npm publish`es via **npm trusted publishing (OIDC)** — no npm token
-or repo secret is stored (one-time setup: npmjs.com → package →
-*Package settings* → *Trusted publishers* → this workflow).
+Publishing is CI-only, on a **daily schedule** (09:00 America/Denver) with
+a manual trigger (Actions tab → *Create release* → *Run workflow*) for urgent
+releases — a push to `main` no longer publishes on its own, so merged PRs
+(batched, including external contributors') don't each get a release.
+Each run first guards on commits since the last release tag and skips if
+there are none; a published build is `npm publish`ed and tagged
+`v<version>` as a GitHub release listing the commits since the previous
+one. The version is computed as `<major>.<minor>.<run-number>` — run
+numbers are consumed by skipped runs too, so the sequence has gaps — via
+**npm trusted publishing (OIDC)** — no npm token or repo secret is stored
+(one-time setup: npmjs.com → package → *Package settings* → *Trusted
+publishers* → this workflow).
 
 ## Documentation
 

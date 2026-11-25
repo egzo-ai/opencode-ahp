@@ -1,14 +1,25 @@
-name: publish
+name: Create release
 
 on:
-  push:
-    branches: [main]
+  # One release per day, not one per push: with external contributor PRs
+  # merging, a push-time release would flood the release feed (and npm)
+  # with mid-cycle churn. The schedule publishes everything merged since
+  # the last release; `workflow_dispatch` ships an urgent fix now (it goes
+  # through the same guard — a trigger with nothing new since the last
+  # release publishes nothing). Schedule crons run in UTC unless given an
+  # IANA `timezone`; `America/Denver` keeps the run at 09:00 local across
+  # DST.
+  schedule:
+    - cron: "0 9 * * *"
+      timezone: "America/Denver"
+  workflow_dispatch:
 
 # Publishes must land in commit order: `latest` tracks the highest
 # published version, and a stale build that finishes after a newer one
-# must not win the tag. Queue concurrent runs (never cancel them).
+# must not win the tag. Queue concurrent runs (a scheduled run overlapped
+# by a manual trigger — never cancel them).
 concurrency:
-  group: publish
+  group: release
   cancel-in-progress: false
 
 # Trusted publishing (OIDC): the npm CLI exchanges the OIDC token GitHub
@@ -16,7 +27,7 @@ concurrency:
 # short-lived publish credential — no npm token or repo secret is stored.
 # The publisher is registered on npmjs.com (opencode-ahp → Package
 # settings → Trusted publishers: GitHub Actions, mattzink/opencode-ahp,
-# publish.yml, allow `npm publish`). Requires npm CLI >= 11.5.1 /
+# release.yml, allow `npm publish`). Requires npm CLI >= 11.5.1 /
 # Node >= 22.14 (both satisfied by the mise-managed toolchain).
 permissions:
   id-token: write
@@ -25,44 +36,71 @@ permissions:
   contents: write
 
 jobs:
-  publish:
+  create_release:
+    name: Create release
     runs-on: ubuntu-latest
     steps:
-      # Full clone: the release-notes step needs the push's before-commit
-      # (event.before) to compute the commit range.
+      # Full clone: the release guard resolves the previous release tag
+      # and counts the commits since it; the release-notes step logs that
+      # range.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      # A release covers every commit since the last release tag (this
+      # workflow tags each published build). An empty day, or a manual
+      # trigger right after a release, stops here — before install,
+      # typecheck, or test.
+      - name: Release guard
+        id: guard
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          echo "last-tag=${LAST}" >> "$GITHUB_OUTPUT"
+          if [ -z "$LAST" ] || [ "$(git rev-list "${LAST}..HEAD" --count)" -gt 0 ]; then
+            echo "New commits since ${LAST:-the first release} — releasing."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No commits since ${LAST} — nothing to release."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Node 26 + pnpm (via packageManager) per mise.toml. No `version`
       # input: the action defaults to the newest stable mise release at
       # least 24 h old ("latest" is NOT a magic value — it would be
       # interpolated literally into the release download URL).
       - uses: jdx/mise-action@v5
+        if: steps.guard.outputs.released == 'true'
 
       - name: Install
+        if: steps.guard.outputs.released == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
+        if: steps.guard.outputs.released == 'true'
         run: pnpm typecheck
 
       - name: Test
+        if: steps.guard.outputs.released == 'true'
         run: pnpm test
 
       - name: Compute version
         id: version
+        if: steps.guard.outputs.released == 'true'
         # major.minor from package.json (the in-repo base) plus this
         # workflow's build number, e.g. base 0.1.0 + run 7 -> 0.1.7.
-        # Failed runs consume a build number, so the sequence may have
-        # gaps; each published version is unique either way.
+        # Skipped (no-change) and failed runs consume a build number, so
+        # the sequence may have gaps; each published version is unique
+        # either way.
         run: |
           BASE=$(node -p "require('./package.json').version" | cut -d. -f1,2)
           echo "version=${BASE}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Set version
+        if: steps.guard.outputs.released == 'true'
         run: pnpm version "${{ steps.version.outputs.version }}" --no-git-tag-version
 
       - name: Publish
+        if: steps.guard.outputs.released == 'true'
         # `npm publish` (not `pnpm publish`): the npm CLI is what detects
         # the OIDC environment and performs the token exchange. Unscoped
         # name: public by default, no --access flag needed. prepublishOnly
@@ -70,22 +108,22 @@ jobs:
         run: npm publish
 
       - name: Write release notes
+        if: steps.guard.outputs.released == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          LAST_TAG: ${{ steps.guard.outputs.last-tag }}
         run: |
           # One release per published build: a short pointer to the install
-          # instructions plus the commits in this push (event.before..
-          # GITHUB_SHA, read from the event payload JSON — GitHub's
-          # generate_release_notes only lists merged PRs, which is useless
-          # for a project that commits directly to main).
-          BEFORE=$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")
-          # event.after == GITHUB_SHA for push events. A zero/missing
-          # `before` (branch-creating push) has no usable range: list the
-          # release commit alone.
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            RANGE="${GITHUB_SHA}~1..${GITHUB_SHA}"
+          # instructions plus every commit since the last release tag (the
+          # schedule/dispatch events carry no push before-commit to range
+          # from). --no-merges drops the merge commits from the list while
+          # crediting each author — external contributors included.
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="${LAST_TAG}..${GITHUB_SHA}"
           else
-            RANGE="${BEFORE}..${GITHUB_SHA}"
+            # No release tag at all (a fresh repo): list the release
+            # commit alone.
+            RANGE="${GITHUB_SHA}~1..${GITHUB_SHA}"
           fi
           {
             echo "opencode-ahp \`${VERSION}\` — AHP 1.0.0 host for opencode v2, published to npm."
@@ -104,6 +142,7 @@ jobs:
           } > release-notes.md
 
       - name: Create release
+        if: steps.guard.outputs.released == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
