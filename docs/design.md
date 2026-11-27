@@ -1469,7 +1469,29 @@ plugin-published events count as location activity (or exposes
 retention to plugins), the config entry becomes unnecessary again —
 tracked in [`futures.md`](futures.md).
 
-### 15.4 What is intentionally not durable
+### 15.4 Turn history
+
+A chat's turns live in memory, but opencode's session store keeps the
+messages they came from. When the host registers a session it did not
+create — through `listSessions` after a reload or restart, or through
+`session.created` for a session the TUI starts — it loads the session's
+durable messages (`ctx.session.context`, the facade's optional
+`sessionHistory`) and rebuilds the finished turns from them
+(`src/history.ts`): a user message opens a turn, the assistant messages
+after it give its reasoning, markdown and tool-call parts through the
+same helpers as the live pump, and the `idle` marker after them says
+how it ended (`succeeded` → complete, `interrupted` → cancelled,
+`failed` → error). A turn with no `idle` yet is still running and is
+left to the live pump. The turns go into the chat as one
+`chat/turnsLoaded` action, so a client subscribed already receives them,
+and a later snapshot carries them. Only turns that began before the
+registration are loaded, so a turn the live pump saw never appears
+twice; hydrated turn ids are `hist_<messageID>`, stable across loads,
+and the reducer drops ids the chat has. The load is best effort: a
+failure logs and leaves the chat as it was. Paging older history with
+`fetchTurns` is still future work ([futures §1.3](futures.md#13-turn-history-paging-fetchturns)).
+
+### 15.5 What is intentionally not durable
 
 All host-internal state is in memory and is rebuilt on reload: the
 session/chat record maps, the replay buffer, the clientId registry,

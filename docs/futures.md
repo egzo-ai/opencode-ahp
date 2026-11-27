@@ -139,15 +139,13 @@ terminal modes remain potential work, each with its own blocker:
   Note that the agent's own command execution (`shell` tool) is
   pipe-backed, not a pty — there is no pty to claim for a tool call.
 
-### 1.3 Turn history hydration (`fetchTurns`)
+### 1.3 Turn history paging (`fetchTurns`)
 
-**The gap.** A location reload or server restart tears down all
-in-memory turn state; a reconnecting client sees the session's *state*
-(titles, chats, current activity) but not its past turns. It is the
-one durability gap with a clear implementation path — but it is
-**potential, not planned**: it is extension-scale work, and no client
-currently asks for it (below), so doing it now would buy nothing
-visible.
+**What is left.** A session registered after a reload or restart gets
+its finished turns from opencode's store in one `chat/turnsLoaded`
+([design §15.4](design.md#154-turn-history)). What is not built is
+paging: `fetchTurns` and a bounded subscribe view, for sessions whose
+history is too long to load at once.
 
 **The AHP wire path already exists in 1.0.0:**
 
@@ -309,7 +307,7 @@ back it.
 
 | Command | Status | opencode backing | Notes |
 | --- | --- | --- | --- |
-| `fetchTurns` | not implemented | **yes** — `ctx.session.context` | Turn history hydration; [§1.3](#13-turn-history-hydration-fetchturns). |
+| `fetchTurns` | not implemented | **yes** — `ctx.session.context` | Turn history hydration; [§1.3](#13-turn-history-paging-fetchturns). |
 | `moveChat` | not implemented | no — no session fork/copy API; a chat is 1:1 with its opencode backend session | 1.1.0-in-flight companion action `chat/moved` ([§3.2](#32-what-is-in-flight-on-upstream-main)); VS Code 1.145.2 does not call it. |
 | `completions` | not implemented | **partially** — `ctx.experimental.generate` (stateless model generation) | A mapping is implementable today; no client in the field drives it against this host. |
 | `sessionConfigCompletions` | **intentionally unreachable** | n/a — `resolveSessionConfig` answers an empty schema | The client-side guard ("property not advertised") makes the command unreachable; never advertise what we don't implement. |
@@ -458,7 +456,7 @@ Read from the registry maps on `main`:
 - **Decision triggers to watch:** automations stabilizing (relevant
   only if an opencode-side automation concept is ever built — the
   blocker today is opencode, not the protocol); client adoption of
-  `fetchTurns` (makes [§1.3](#13-turn-history-hydration-fetchturns)
+  `fetchTurns` (makes [§1.3](#13-turn-history-paging-fetchturns)
   user-visible); any 1.1.0 change to elicitation or terminal I/O
   semantics that alters the mappings in [§1.1](#11-elicitation-completion-decision-pending)
   / [design.md §12](design.md#12-synthetic-terminals).
@@ -582,7 +580,7 @@ command requirements (§6).
   answer with (`once` / `reject` today) — blocked by the `always` gap
   ([§1.4](#14-small-chat-surface-gaps)).
 - **`fetchTurns` is unused by the 1.145.2 client** (type-only in the
-  official TS client) — turn hydration ([§1.3](#13-turn-history-hydration-fetchturns))
+  official TS client) — turn hydration ([§1.3](#13-turn-history-paging-fetchturns))
   has no user-visible effect until client adoption.
 - **Watch:** AHP client updates in VS Code that drive more of the
   protocol surface (resource watches, `root/progress`, automations,

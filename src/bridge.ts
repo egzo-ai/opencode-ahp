@@ -287,6 +287,8 @@ export type V2EventOutcome =
  * registry/session read APIs, which the docs guarantee reflect every
  * registration so far, including during plugin setup.
  */
+import type { HistoryMessage } from "./history.js";
+
 export interface OpencodeFacade {
   /** Live provider/model catalog (`ctx.provider` + `ctx.model`). */
   listCatalog(): Promise<readonly FacadeProvider[]>;
@@ -331,6 +333,12 @@ export interface OpencodeFacade {
   }): Promise<FacadeSession>;
   /** All opencode sessions for this location. */
   listSessions(): Promise<readonly FacadeSession[]>;
+  /**
+   * The session's durable messages, oldest first (`ctx.session.context`):
+   * what turn history hydration rebuilds past turns from (history.ts).
+   * Optional — a facade without it hydrates nothing.
+   */
+  sessionHistory?(sessionID: string): Promise<readonly HistoryMessage[]>;
   /** One opencode session, or null when it does not exist. */
   getSession(sessionID: string): Promise<FacadeSession | null>;
   /**

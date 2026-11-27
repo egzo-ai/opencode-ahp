@@ -9,6 +9,7 @@ import { channelKind, isSessionChannel, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { createChatStateStore } from "./state.js";
+import { historyTurns } from "./history.js";
 import { ERROR_INTERNAL, ERROR_SESSION_NOT_FOUND, ERROR_SESSION_EXISTS } from "./host-errors.js";
 import { RpcMessage, ChatRuntime, SessionRecord } from "./host-types.js";
 import { AHP_METADATA_KEY, errorMessage, firstEnabledModelRef } from "./host-util.js";
@@ -39,6 +40,27 @@ export class HostChats extends HostClientTools {
       changesets: new Map(),
       turnSnapshots: new Map(),
     };
+  }
+
+  /**
+   * Turn history hydration (history.ts): load the session's finished turns
+   * from opencode's durable store into the chat, as `chat/turnsLoaded`, so a
+   * chat registered after a restart, or a session the TUI created, keeps
+   * its past. Only turns that began before `before` (the registration) are
+   * loaded: what runs from then on is the live pump's, and must not appear
+   * twice. Best effort (R2): a failure logs and leaves the chat as it is.
+   */
+  protected async hydrateChat(chat: ChatRuntime, before: number): Promise<void> {
+    const load = this.opts.facade.sessionHistory;
+    if (load === undefined) return;
+    try {
+      const messages = await load.call(this.opts.facade, chat.sessionID);
+      const turns = historyTurns(messages).filter((t) => t.startedAt === undefined || Date.parse(t.startedAt) < before);
+      if (turns.length === 0) return;
+      this.publish({ channel: chat.uri, action: { type: ActionType.ChatTurnsLoaded, turns } });
+    } catch (err) {
+      this.log(`turn history of ${chat.sessionID} not loaded: ${errorMessage(err)}`);
+    }
   }
 
   /**

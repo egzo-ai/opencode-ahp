@@ -354,7 +354,7 @@ Nothing is installed on PC B — VS Code ships the AHP client.
    re-appears in the picker (VS Code reconnects) and the session catalog
    returns from the root snapshot. (Paging past **turn** history is not
    implemented — `fetchTurns` is a potential item, see
-   [futures.md §1.3](futures.md#13-turn-history-hydration-fetchturns).)
+   [futures.md §1.3](futures.md#13-turn-history-paging-fetchturns).)
 
 ### 4.4 Teardown (PC A)
 

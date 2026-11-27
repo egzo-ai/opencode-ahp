@@ -1,0 +1,335 @@
+[
+ {
+  "id": "msg_20ec39ab7001HN5267cRM9JAko",
+  "time": {
+   "created": 1795544029901
+  },
+  "text": "Run the shell command 'ls -la' with your bash tool, then reply with the number of entries.",
+  "files": [],
+  "type": "user"
+ },
+ {
+  "id": "msg_20ec39ae5001zPEeF5kpJ5lcCZ",
+  "time": {
+   "created": 1795544029934,
+   "streamed": 1795544030749,
+   "completed": 1795544030787
+  },
+  "type": "assistant",
+  "agent": "build",
+  "model": {
+   "id": "deepseek-v4.1-flash-free",
+   "providerID": "opencode",
+   "variant": "default"
+  },
+  "content": [
+   {
+    "type": "tool",
+    "id": "call-227df0ba-822d-4d5f-af1a-8663846a2dec",
+    "name": "shell",
+    "executed": false,
+    "state": {
+     "status": "completed",
+     "input": {
+      "command": "ls -la"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "total 4\ndrwxr-xr-x 1 agent agent  26 Nov 24 18:09 .\ndrwxr-xr-x 1 agent agent 182 Nov 24 18:13 ..\ndrwxr-xr-x 1 agent agent  82 Nov 24 18:09 .git\n-rw-r--r-- 1 agent agent   6 Nov 24 18:09 README.md\n"
+      }
+     ],
+     "metadata": {
+      "status": "completed",
+      "truncated": false,
+      "exit": 0
+     }
+    },
+    "time": {
+     "created": 1795544030738,
+     "ran": 1795544030746,
+     "completed": 1795544030773
+    }
+   }
+  ],
+  "snapshot": {
+   "start": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "end": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "files": []
+  },
+  "finish": "tool-calls",
+  "rawFinish": "tool_calls",
+  "cost": 0,
+  "tokens": {
+   "input": 3981,
+   "output": 40,
+   "reasoning": 0,
+   "cache": {
+    "read": 1920,
+    "write": 0
+   }
+  }
+ },
+ {
+  "id": "msg_20ec39e51001EPNUVaoMBqd7tv",
+  "time": {
+   "created": 1795544030810,
+   "streamed": 1795544031767,
+   "completed": 1795544031782
+  },
+  "type": "assistant",
+  "agent": "build",
+  "model": {
+   "id": "deepseek-v4.1-flash-free",
+   "providerID": "opencode",
+   "variant": "default"
+  },
+  "content": [
+   {
+    "type": "reasoning",
+    "text": "Count entries: 4 lines total, including . and .. \u2014 4 entries.",
+    "native": {
+     "reasoningField": "reasoning_content"
+    },
+    "time": {
+     "created": 1795544031556,
+     "completed": 1795544031761
+    }
+   },
+   {
+    "type": "text",
+    "text": "`ls -la` returned **4 entries**: `.`, `..`, `.git`, and `README.md`."
+   }
+  ],
+  "snapshot": {
+   "start": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "end": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "files": []
+  },
+  "finish": "stop",
+  "rawFinish": "stop",
+  "cost": 0,
+  "tokens": {
+   "input": 161,
+   "output": 25,
+   "reasoning": 17,
+   "cache": {
+    "read": 5888,
+    "write": 0
+   }
+  }
+ },
+ {
+  "id": "msg_20ec3a22d001Cd6S2Emi5fj5Si",
+  "time": {
+   "created": 1795544031789
+  },
+  "type": "idle",
+  "outcome": "succeeded"
+ },
+ {
+  "id": "msg_20ec46e9e0015b4hu4TNhlrue5",
+  "time": {
+   "created": 1795544084144
+  },
+  "text": "Now read README.md with your read tool and quote it.",
+  "files": [],
+  "type": "user"
+ },
+ {
+  "id": "msg_20ec46eba001MKR20e77xsvycb",
+  "time": {
+   "created": 1795544084162,
+   "streamed": 1795544086652,
+   "completed": 1795544086676
+  },
+  "type": "assistant",
+  "agent": "build",
+  "model": {
+   "id": "deepseek-v4.1-flash-free",
+   "providerID": "opencode",
+   "variant": "default"
+  },
+  "content": [
+   {
+    "type": "tool",
+    "id": "call_a925553f90a04e17ad309749",
+    "name": "read",
+    "executed": false,
+    "state": {
+     "status": "completed",
+     "input": {
+      "path": "README.md"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Read file README.md, lines 1-1\n1: hello"
+      }
+     ],
+     "metadata": {
+      "truncated": false
+     }
+    },
+    "time": {
+     "created": 1795544086440,
+     "ran": 1795544086647,
+     "completed": 1795544086661
+    }
+   }
+  ],
+  "snapshot": {
+   "start": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "end": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "files": []
+  },
+  "finish": "tool-calls",
+  "rawFinish": "tool_calls",
+  "cost": 0,
+  "tokens": {
+   "input": 4187,
+   "output": 39,
+   "reasoning": 0,
+   "cache": {
+    "read": 1920,
+    "write": 0
+   }
+  }
+ },
+ {
+  "id": "msg_20ec478a3001a4sFrbSteVDkq1",
+  "time": {
+   "created": 1795544086701,
+   "streamed": 1795544088289,
+   "completed": 1795544088302
+  },
+  "type": "assistant",
+  "agent": "build",
+  "model": {
+   "id": "deepseek-v4.1-flash-free",
+   "providerID": "opencode",
+   "variant": "default"
+  },
+  "content": [
+   {
+    "type": "text",
+    "text": "README.md contains:\n\n> hello"
+   }
+  ],
+  "snapshot": {
+   "start": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "end": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "files": []
+  },
+  "finish": "stop",
+  "rawFinish": "stop",
+  "cost": 0,
+  "tokens": {
+   "input": 156,
+   "output": 8,
+   "reasoning": 0,
+   "cache": {
+    "read": 6016,
+    "write": 0
+   }
+  }
+ },
+ {
+  "id": "msg_20ec47ef4001LNuzPHUsWnETOs",
+  "time": {
+   "created": 1795544088308
+  },
+  "type": "idle",
+  "outcome": "succeeded"
+ },
+ {
+  "id": "msg_20ec57af6001J5kihHnYDBt0HI",
+  "time": {
+   "created": 1795544152837
+  },
+  "text": "Run the bash command: sleep 30 && echo finished",
+  "type": "user"
+ },
+ {
+  "id": "msg_20ec57b0f001SpKGtGQGpCzO7c",
+  "time": {
+   "created": 1795544152856,
+   "streamed": 1795544155672,
+   "completed": 1795544161844
+  },
+  "type": "assistant",
+  "agent": "build",
+  "model": {
+   "id": "deepseek-v4.1-flash-free",
+   "providerID": "opencode",
+   "variant": "default"
+  },
+  "content": [
+   {
+    "type": "reasoning",
+    "text": "The user asks to run `sleep 30 && echo finished`. Just run it with a timeout above 30s.",
+    "native": {
+     "reasoningField": "reasoning_content"
+    },
+    "time": {
+     "created": 1795544155053,
+     "completed": 1795544155664
+    }
+   },
+   {
+    "type": "tool",
+    "id": "call_885b750249624906b6bca8df",
+    "name": "shell",
+    "executed": false,
+    "state": {
+     "status": "error",
+     "input": {
+      "command": "sleep 30 && echo finished",
+      "timeout": 60000
+     },
+     "error": {
+      "type": "aborted",
+      "message": "Tool execution interrupted"
+     },
+     "metadata": {
+      "shellID": "sh_20ec5861e0018DDN6dGdhNbdGv"
+     }
+    },
+    "time": {
+     "created": 1795544155454,
+     "ran": 1795544155669,
+     "completed": 1795544161828
+    }
+   }
+  ],
+  "snapshot": {
+   "start": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "end": "853694aae8816094a0d875fee7ea26278dbf5d0f",
+   "files": []
+  },
+  "finish": "error",
+  "rawFinish": "tool_calls",
+  "cost": 0,
+  "tokens": {
+   "input": 50,
+   "output": 61,
+   "reasoning": 24,
+   "cache": {
+    "read": 6144,
+    "write": 0
+   }
+  },
+  "error": {
+   "type": "aborted",
+   "message": "Step interrupted"
+  }
+ },
+ {
+  "id": "msg_20ec59e39001rTjlbiPklynsBr",
+  "time": {
+   "created": 1795544161849
+  },
+  "type": "idle",
+  "outcome": "interrupted"
+ }
+]

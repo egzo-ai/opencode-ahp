@@ -5,6 +5,7 @@
  * client tools, the MCP toggle), the fake pty, the JSON-RPC frame harness
  * over `Host`, and the request/action helpers every suite drives through it.
  */
+import type { HistoryMessage } from "../history.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -118,6 +119,8 @@ export class FakeFacade implements OpencodeFacade {
    */
   catalogDelayMs = 0;
   sessions = new Map<string, FacadeSession>();
+  /** Durable messages by session (sessionHistory): turn history hydration's source. */
+  histories = new Map<string, HistoryMessage[]>();
   promptCalls: { sessionID: string; text: string; delivery?: "steer" | "queue" }[] = [];
   switchModelCalls: { sessionID: string; model: { providerID: string; modelID: string; variant?: string } }[] = [];
   switchAgentCalls: { sessionID: string; agent: string }[] = [];
@@ -249,6 +252,9 @@ export class FakeFacade implements OpencodeFacade {
   }
   async listSessions(): Promise<readonly FacadeSession[]> {
     return [...this.sessions.values()];
+  }
+  async sessionHistory(sessionID: string): Promise<readonly HistoryMessage[]> {
+    return this.histories.get(sessionID) ?? [];
   }
   async getSession(sessionID: string): Promise<FacadeSession | null> {
     this.getSessionsCalls.push(sessionID);

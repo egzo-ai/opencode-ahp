@@ -778,6 +778,7 @@ export class HostSessions extends HostChats {
     this.channels.addSessionChannel(recChannel);
     const defaultChat = this.newChatRuntime(rec.defaultChatURI, fs.sessionID, sessionStore.state.title, modifiedAt);
     this.bindChat(rec, defaultChat);
+    void this.hydrateChat(defaultChat, Date.now());
     sessionStore.apply({ type: ActionType.SessionReady });
     sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(defaultChat.chatStore.state) });
     sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: rec.defaultChatURI });

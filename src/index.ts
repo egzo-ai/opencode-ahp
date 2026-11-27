@@ -62,6 +62,7 @@ import { isRecord, resolveOptions, type Options } from "./options.js";
 import { normalizeDirPrefix, PathPolicy } from "./path-policy.js";
 import { createListener, type Listener } from "./transport.js";
 import { Host } from "./host.js";
+import type { HistoryMessage } from "./history.js";
 import type { SpawnPty } from "./host-types.js";
 import { errorMessage } from "./error.js";
 import {
@@ -716,6 +717,9 @@ function implementFacade(
     async listSessions() {
       const { data } = await ctx.session.list();
       return data.map(mapSessionInfo);
+    },
+    async sessionHistory(sessionID: string) {
+      return (await ctx.session.context({ sessionID })) as unknown as readonly HistoryMessage[];
     },
     async getSession(sessionID: string) {
       try {
