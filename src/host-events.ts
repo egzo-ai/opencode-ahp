@@ -3,8 +3,9 @@
  */
 
 import { HostDispatch } from "./host-dispatch.js";
-import { ActionType, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
+import { ActionType, PendingMessage, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
 import { displayNameFor, pastTenseMessageFor, systemNotificationMessage, userMessage, FacadeEvent } from "./bridge.js";
+import { ChatRuntime } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, errorMessage, mapToolResultContent } from "./host-util.js";
 
 export class HostEvents extends HostDispatch {
@@ -48,6 +49,21 @@ export class HostEvents extends HostDispatch {
   private pendingExternal = new Map<string, FacadeEvent[]>();
 
   // ── opencode event pump handlers ───────────────────────────────────────
+  /**
+   * The client's queued message an opencode inbox item carries, taken
+   * off the link: the one whose prompt resolved with this inbox id, or,
+   * should the delivery come first, the oldest queued message with the
+   * same text.
+   */
+  private takeQueuedPending(chat: ChatRuntime, inboxID: string, text: string): PendingMessage | undefined {
+    const queued = chat.chatStore.state.queuedMessages ?? [];
+    const id = chat.queuedPending.get(inboxID);
+    chat.queuedPending.delete(inboxID);
+    if (id !== undefined) return queued.find((m) => m.id === id);
+    const linked = new Set(chat.queuedPending.values());
+    return queued.find((m) => !linked.has(m.id) && m.message.text === text);
+  }
+
   private async handleEvent(ev: FacadeEvent): Promise<void> {
     const waiting = ev.type === "session.created" ? undefined : this.pendingExternal.get(ev.sessionID);
     if (waiting !== undefined) {
@@ -127,14 +143,40 @@ export class HostEvents extends HostDispatch {
         return;
       case "inbox.enqueued":
         chat.lastInbox = {
+          id: ev.inboxID,
           text: ev.text,
           delivery: ev.delivery,
           ...(ev.subagent !== undefined ? { subagent: true } : {}),
         };
+        if (ev.delivery === "queue") {
+          chat.queuedInbox.set(ev.inboxID, { text: ev.text, ...(ev.subagent !== undefined ? { subagent: true } : {}) });
+        }
         return;
-      case "inbox.delivered":
-        // Steering consumption is handled at turn end (finishTurn).
+      case "inbox.delivered": {
+        // Steering consumption is handled at turn end (finishTurn). A
+        // queued item is delivered after the running turn's answer, inside
+        // the same execution: the running turn ends here, and the queued
+        // message's turn starts (AHP: a new turn after the current one).
+        const item = chat.queuedInbox.get(ev.inboxID);
+        if (item === undefined) return;
+        chat.queuedInbox.delete(ev.inboxID);
+        const pending = this.takeQueuedPending(chat, ev.inboxID, item.text);
+        if (chat.currentTurnId !== null && chat.turnInboxID === ev.inboxID) return; // the turn this execution started for it
+        if (chat.currentTurnId !== null) {
+          this.publish({
+            channel: chatURI,
+            action: { type: ActionType.ChatTurnComplete, turnId: chat.currentTurnId, duration: this.turnDuration(chat) },
+          });
+          await this.finishTurn(chat);
+        }
+        this.startTurn(
+          chat,
+          pending?.message ?? (item.subagent ? systemNotificationMessage(item.text) : userMessage(item.text)),
+          pending?.id,
+          ev.inboxID,
+        );
         return;
+      }
       case "execution.started":
         if (chat.currentTurnId !== null) return; // write-ahead already claimed the turn
         // Orphan turn (an external TUI prompt, or a handoff this host did
@@ -144,13 +186,19 @@ export class HostEvents extends HostDispatch {
         // carries the report text verbatim under a system-notification
         // origin (design §8).
         const inbox = chat.lastInbox;
+        // a queued item opencode starts an execution for (one queued while
+        // it was idle): the turn is that item's
+        const queuedItem = inbox !== null && chat.queuedInbox.has(inbox.id) ? this.takeQueuedPending(chat, inbox.id, inbox.text) : undefined;
         this.startTurn(
           chat,
-          inbox === null
-            ? userMessage("")
-            : inbox.subagent
-              ? systemNotificationMessage(inbox.text)
-              : userMessage(inbox.text),
+          queuedItem?.message ??
+            (inbox === null
+              ? userMessage("")
+              : inbox.subagent
+                ? systemNotificationMessage(inbox.text)
+                : userMessage(inbox.text)),
+          queuedItem?.id,
+          inbox?.id,
         );
         return;
       case "execution.succeeded":

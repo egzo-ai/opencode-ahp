@@ -420,7 +420,11 @@ describe("steering and queue", () => {
     h.stop();
   });
 
-  it("queues for the next turn (delivery:queue) and auto-starts it from the queue at turn end", async () => {
+  // opencode (2.3) delivers a queued inbox item after the running turn's
+  // answer, inside the same execution: session.inbox.delivered sits
+  // between the two answers, and one execution.succeeded ends both. After
+  // an interrupt the item stays in its inbox, undelivered.
+  async function queuedDuringATurn() {
     const h = makeHarness();
     h.init(1, "c1");
     await waitInit(h, 1);
@@ -433,7 +437,9 @@ describe("steering and queue", () => {
       action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "go", origin: { kind: "user" } } },
     });
     await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
-
+    h.facade.push({ type: "inbox.enqueued", sessionID: SES, inboxID: "msg_1", text: "go", delivery: "steer" });
+    h.facade.push({ type: "execution.started", sessionID: SES });
+    h.facade.push({ type: "inbox.delivered", sessionID: SES, inboxID: "msg_1" });
     h.send(1, "dispatchAction", {
       channel: chatURI,
       clientSeq: 2,
@@ -441,17 +447,68 @@ describe("steering and queue", () => {
     });
     await waitFor(() => h.facade.promptCalls.length === 2, "queue prompt");
     expect(h.facade.promptCalls[1]).toEqual({ sessionID: SES, text: "next up", delivery: "queue" });
+    // the fake resolves the prompt with msg_2: the inbox item opencode holds
+    h.facade.push({ type: "inbox.enqueued", sessionID: SES, inboxID: "msg_2", text: "next up", delivery: "queue" });
+    await waitForAction(h, chatURI, "chat/pendingMessageSet", (a) => a.action.id === "q1");
+    h.facade.push({ type: "text.ended", sessionID: SES, assistantMessageID: "a1", ordinal: 0, text: "first answer" });
+    return { h, chatURI };
+  }
 
-    // No new prompt call — the queued turn is state-only: at turn end the
-    // host mints a turnStarted carrying queuedMessageId and the reducer dequeues.
-    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+  it("starts the queued turn when opencode delivers the queued item, inside the running execution", async () => {
+    const { h, chatURI } = await queuedDuringATurn();
+    h.facade.push({ type: "inbox.delivered", sessionID: SES, inboxID: "msg_2" });
     const started = await waitForAction(h, chatURI, "chat/turnStarted", (a) => a.action.queuedMessageId === "q1");
     expect(started.origin).toBeUndefined();
     expect(started.action.message.text).toBe("next up");
+    const first = h.actionsOn(chatURI).find((a) => a.action.type === "chat/turnComplete");
+    expect(first).toBeDefined();
+    expect(first.action.turnId).not.toBe(started.action.turnId);
+    expect(h.actionsOn(chatURI).indexOf(first)).toBeLessThan(h.actionsOn(chatURI).indexOf(started));
+    h.facade.push({ type: "text.ended", sessionID: SES, assistantMessageID: "a2", ordinal: 0, text: "second answer" });
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitFor(() => h.actionsOn(chatURI).filter((a) => a.action.type === "chat/turnComplete").length === 2, "the queued turn completes");
     const chat = await chatSnapshotState(h, 1, chatURI, 131);
-    expect(chat.activeTurn!.message.text).toBe("next up");
+    expect(chat.activeTurn).toBeUndefined();
     expect(chat.queuedMessages).toBeUndefined();
-    expect(h.facade.promptCalls).toHaveLength(2); // still no third prompt
+    expect(chat.turns.map((t) => t.message.text)).toEqual(["go", "next up"]);
+    expect(JSON.stringify(chat.turns[0])).toContain("first answer");
+    expect(JSON.stringify(chat.turns[0])).not.toContain("second answer");
+    expect(JSON.stringify(chat.turns[1])).toContain("second answer");
+    expect(h.facade.promptCalls).toHaveLength(2); // opencode runs it itself
+    h.stop();
+  });
+
+  it("does not start a queued turn at the end of a turn opencode did not deliver it in", async () => {
+    const { h, chatURI } = await queuedDuringATurn();
+    h.facade.push({ type: "execution.interrupted", sessionID: SES, reason: "user" });
+    await waitForAction(h, chatURI, "chat/turnCancelled");
+    await new Promise((r) => setTimeout(r, 50));
+    const chat = await chatSnapshotState(h, 1, chatURI, 132);
+    expect(chat.activeTurn).toBeUndefined(); // no turn that opencode never runs
+    expect(chat.queuedMessages?.map((m) => m.id)).toEqual(["q1"]); // still queued, as in opencode's inbox
+    expect(h.actionsOn(chatURI).some((a) => a.action.type === "chat/turnStarted" && a.action.queuedMessageId === "q1")).toBe(false);
+    h.stop();
+  });
+
+  it("splits a turn at a queued prompt from outside AHP (the TUI), and keeps one queued while idle as its own turn", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    // queued while idle: opencode starts an execution for it
+    h.facade.push({ type: "inbox.enqueued", sessionID: SES, inboxID: "msg_a", text: "from the TUI", delivery: "queue" });
+    h.facade.push({ type: "execution.started", sessionID: SES });
+    h.facade.push({ type: "inbox.delivered", sessionID: SES, inboxID: "msg_a" });
+    // queued during that turn
+    h.facade.push({ type: "inbox.enqueued", sessionID: SES, inboxID: "msg_b", text: "then this", delivery: "queue" });
+    h.facade.push({ type: "inbox.delivered", sessionID: SES, inboxID: "msg_b" });
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitFor(() => h.actionsOn(chatURI).filter((a) => a.action.type === "chat/turnComplete").length === 2, "two turns");
+    const chat = await chatSnapshotState(h, 1, chatURI, 133);
+    expect(chat.turns.map((t) => t.message.text)).toEqual(["from the TUI", "then this"]);
+    expect(chat.activeTurn).toBeUndefined();
     h.stop();
   });
 

@@ -343,7 +343,10 @@ export class HostDispatch extends HostSessions {
         : "queue"
       : undefined;
     try {
-      await this.opts.facade.prompt({ sessionID: chat.sessionID, text: message.text, delivery });
+      const { messageID } = await this.opts.facade.prompt({ sessionID: chat.sessionID, text: message.text, delivery });
+      // opencode delivers it after the running turn's answer, as the inbox
+      // item the prompt resolves with: its turn starts then (handleEvent)
+      if (delivery === "queue") chat.queuedPending.set(messageID, id);
     } catch (err) {
       this.echo(chatURI, action, origin, `prompt failed: ${errorMessage(err)}`);
       return;
