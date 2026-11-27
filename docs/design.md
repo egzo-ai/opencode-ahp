@@ -859,7 +859,7 @@ exactly as written:
 | `step.ended` | `chat/usage` for the latest model call, not the accumulated session total. Prompt tokens include cache reads/writes and completion tokens include reasoning. VS Code uses these fields for the current context window. |
 | `permission.asked` (tool-sourced) | `chat/toolCallReady` *without* `confirmed` → status *pending-confirmation*, plus a `toolConfirmation` input request on the session channel (the in-window approval prompt). Non-tool permissions have no AHP counterpart and are logged. |
 | `permission.replied` | safety net: removes the confirmation input request if the client's `chat/toolCallConfirmed` did not already. |
-| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; an enqueued synthetic item tagged `metadata.source: "subagent"` (a subagent completion report) is marked as such for the orphan-turn seeding; steering consumption happens at turn end. The delivery of a `queue` item is the queued handoff: the running turn completes (`chat/turnComplete` + `finishTurn`) and the queued message's turn starts (`chat/turnStarted`, with `queuedMessageId` when a client queued it) — see below. |
+| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; an enqueued synthetic item tagged `metadata.source: "subagent"` (a subagent completion report) is marked as such for the orphan-turn seeding; the delivery of a client's steering item takes it off the pending state (`chat/pendingMessageRemoved`, as AHP has the server do when it injects one). The delivery of a `queue` item is the queued handoff: the running turn completes (`chat/turnComplete` + `finishTurn`) and the queued message's turn starts (`chat/turnStarted`, with `queuedMessageId` when a client queued it) — see below. |
 
 **Subagent completion reports drive orphan turns.** When a subagent
 child goes idle, opencode admits its report to the parent's inbox as a
@@ -875,8 +875,9 @@ the terminal actions drop any turn whose id the host never claimed. If
 the parent is mid-turn, the steer is consumed at a step boundary of the
 running turn and no orphan turn starts.
 
-`finishTurn` (after any turn terminal) clears the steering message the
-turn consumed (`chat/pendingMessageRemoved`), drops the ended turn's
+`finishTurn` (after any turn terminal) clears a steering message still
+pending (one opencode did not report delivering —
+`chat/pendingMessageRemoved`), drops the ended turn's
 terminal rows from the root catalog, and refreshes the chat's subscribed
 changesets (the "after" content is read from disk here).
 

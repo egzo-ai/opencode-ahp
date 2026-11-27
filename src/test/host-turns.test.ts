@@ -420,6 +420,42 @@ describe("steering and queue", () => {
     h.stop();
   });
 
+  it("takes a steering message off the pending state when opencode delivers it into the running turn", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "go", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.push({ type: "text.ended", sessionID: SES, assistantMessageID: "a1", ordinal: 0, text: "before" });
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/pendingMessageSet", kind: "steering", id: "s1", message: { text: "steer me", origin: { kind: "user" } } },
+    });
+    await waitForAction(h, chatURI, "chat/pendingMessageSet");
+    // the fake resolves the prompt with msg_2: the inbox item opencode delivers at its next step boundary
+    h.facade.push({ type: "inbox.enqueued", sessionID: SES, inboxID: "msg_2", text: "steer me", delivery: "steer" });
+    h.facade.push({ type: "inbox.delivered", sessionID: SES, inboxID: "msg_2" });
+    const removed = await waitForAction(h, chatURI, "chat/pendingMessageRemoved");
+    expect(removed.action).toMatchObject({ kind: "steering", id: "s1" });
+    let chat = await chatSnapshotState(h, 1, chatURI, 130);
+    expect(chat.steeringMessage).toBeUndefined();
+    expect(chat.activeTurn).toBeDefined(); // mid-turn, not at its end
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    expect(h.actionsOn(chatURI).filter((a) => a.action.type === "chat/pendingMessageRemoved")).toHaveLength(1);
+    chat = await chatSnapshotState(h, 1, chatURI, 131);
+    expect(chat.activeTurn).toBeUndefined();
+    h.stop();
+  });
+
   // opencode (2.3) delivers a queued inbox item after the running turn's
   // answer, inside the same execution: session.inbox.delivered sits
   // between the two answers, and one execution.succeeded ends both. After

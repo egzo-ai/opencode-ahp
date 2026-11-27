@@ -3,7 +3,7 @@
  */
 
 import { HostDispatch } from "./host-dispatch.js";
-import { ActionType, PendingMessage, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
+import { ActionType, PendingMessage, PendingMessageKind, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
 import { displayNameFor, pastTenseMessageFor, systemNotificationMessage, userMessage, FacadeEvent } from "./bridge.js";
 import { ChatRuntime } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, errorMessage, mapToolResultContent } from "./host-util.js";
@@ -153,10 +153,21 @@ export class HostEvents extends HostDispatch {
         }
         return;
       case "inbox.delivered": {
-        // Steering consumption is handled at turn end (finishTurn). A
+        // A steering item leaves the pending state here (a steering message
+        // opencode never delivered is cleared at turn end, finishTurn). A
         // queued item is delivered after the running turn's answer, inside
         // the same execution: the running turn ends here, and the queued
         // message's turn starts (AHP: a new turn after the current one).
+        const steering = chat.steeringPending.get(ev.inboxID);
+        if (steering !== undefined) {
+          // AHP: the server removes a steering message when it injects it
+          // into the turn — opencode just did.
+          chat.steeringPending.delete(ev.inboxID);
+          if (chat.chatStore.state.steeringMessage?.id === steering) {
+            this.publish({ channel: chatURI, action: { type: ActionType.ChatPendingMessageRemoved, kind: PendingMessageKind.Steering, id: steering } });
+          }
+          return;
+        }
         const item = chat.queuedInbox.get(ev.inboxID);
         if (item === undefined) return;
         chat.queuedInbox.delete(ev.inboxID);

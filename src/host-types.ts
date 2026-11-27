@@ -89,6 +89,12 @@ export interface ChatRuntime {
    * client sent as it (the prompt resolves with the inbox id).
    */
   queuedPending: Map<string, string>;
+  /**
+   * Inbox id → the `chat/pendingMessageSet` id of the steering message a
+   * client sent as it: opencode delivers it at a step boundary of the
+   * running turn, which is when it leaves the pending state.
+   */
+  steeringPending: Map<string, string>;
   /** The inbox item the active turn was started for, when known. */
   turnInboxID: string | null;
   // ── changesets ────────────────────────────────────────────────
