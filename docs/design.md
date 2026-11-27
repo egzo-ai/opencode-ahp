@@ -825,7 +825,7 @@ sequenceDiagram
         H-->>C: chat/responsePart, chat/delta, chat/toolCall*, chat/usage …
     end
     O-->>H: session.execution.succeeded
-    H-->>C: chat/turnComplete + finishTurn (queue/steering handoff, changeset refresh)
+    H-->>C: chat/turnComplete + finishTurn (steering cleanup, changeset refresh)
 ```
 
 Event → action mapping (host side). The left column names the mapped
@@ -855,7 +855,7 @@ exactly as written:
 | `step.ended` | `chat/usage` for the latest model call, not the accumulated session total. Prompt tokens include cache reads/writes and completion tokens include reasoning. VS Code uses these fields for the current context window. |
 | `permission.asked` (tool-sourced) | `chat/toolCallReady` *without* `confirmed` → status *pending-confirmation*, plus a `toolConfirmation` input request on the session channel (the in-window approval prompt). Non-tool permissions have no AHP counterpart and are logged. |
 | `permission.replied` | safety net: removes the confirmation input request if the client's `chat/toolCallConfirmed` did not already. |
-| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; an enqueued synthetic item tagged `metadata.source: "subagent"` (a subagent completion report) is marked as such for the orphan-turn seeding; steering consumption happens at turn end. |
+| `inbox.enqueued` / `inbox.delivered` | remembered on the chat; an enqueued synthetic item tagged `metadata.source: "subagent"` (a subagent completion report) is marked as such for the orphan-turn seeding; steering consumption happens at turn end. The delivery of a `queue` item is the queued handoff: the running turn completes (`chat/turnComplete` + `finishTurn`) and the queued message's turn starts (`chat/turnStarted`, with `queuedMessageId` when a client queued it) — see below. |
 
 **Subagent completion reports drive orphan turns.** When a subagent
 child goes idle, opencode admits its report to the parent's inbox as a
@@ -872,12 +872,23 @@ the parent is mid-turn, the steer is consumed at a step boundary of the
 running turn and no orphan turn starts.
 
 `finishTurn` (after any turn terminal) clears the steering message the
-turn consumed (`chat/pendingMessageRemoved`), auto-starts the next turn
-from the queue (the queued prompt was already sent to opencode with
-`delivery: "queue"` — opencode starts it itself; this only updates AHP
-state), drops the ended turn's terminal rows from the root catalog, and
-refreshes the chat's subscribed changesets (the "after" content is read
-from disk here).
+turn consumed (`chat/pendingMessageRemoved`), drops the ended turn's
+terminal rows from the root catalog, and refreshes the chat's subscribed
+changesets (the "after" content is read from disk here).
+
+A queued message does not start at a turn terminal. opencode holds a
+`delivery: "queue"` prompt in its inbox and delivers it after the running
+turn's answer, **inside the same execution**: `session.inbox.delivered`
+for the item sits between the two answers, and a single
+`execution.succeeded` ends both. That delivery is the handoff: the host
+completes the running turn and starts the queued one, so the second
+answer streams into its own turn. The prompt resolves with the inbox id,
+which links the item to the client's `chat/pendingMessageSet` id. After an
+interrupt (or a failure) opencode keeps the item in its inbox,
+undelivered, so it stays queued in AHP too — AHP starts a queued message
+after a turn that finishes naturally — and runs after the next turn. A
+`queue` item opencode starts an execution for (one queued while it was
+idle, e.g. from the TUI) is the orphan turn's own message.
 
 If the pump itself fails (a bridge error), the error is logged and the
 pump stops — the host keeps serving; streaming for new turns is gone
@@ -944,13 +955,13 @@ identifies a single chat once multi-chat is on).
 | Action | Host behavior |
 | --- | --- |
 | `chat/turnStarted` | Rejected when a turn is already active ("follow-ups go via `chat/pendingMessageSet`"). Otherwise: apply the message's model/agent selection to this chat's opencode session, **claim the turn before the prompt** (write-ahead, so a racing `execution.started` still joins it; reverted on prompt failure), prompt, then echo (with a host-normalized `startedAt` — see the reducer-trap note after this table). |
-| `chat/pendingMessageSet` | `steering` mid-turn → prompt with `delivery: "steer"`; `queued` mid-turn → `delivery: "queue"`; with no active turn the message starts a turn right now (echo, then a host-minted `chat/turnStarted` carrying `queuedMessageId`). |
+| `chat/pendingMessageSet` | `steering` mid-turn → prompt with `delivery: "steer"`; `queued` mid-turn → `delivery: "queue"` (its turn starts when opencode delivers it, see §8); with no active turn the message starts a turn right now (echo, then a host-minted `chat/turnStarted` carrying `queuedMessageId`). |
 | `chat/pendingMessageRemoved` | Always rejected: opencode has no inbox cancel — a pending message cannot be withdrawn once sent. |
 | `chat/toolCallConfirmed` | Replies to the pending opencode permission (`once` / `reject`), echoes (reducer → running/cancelled), and clears the session input request. The confirmation UI is the plain approve/deny card because the host publishes no `ConfirmationOption`s — that field on `ToolCallPendingConfirmationState` is optional, and when present the client renders them *instead of* the plain UI. VS Code therefore shows "Allow in this Session ⌄" plus **"Skip"**, where **Skip is the deny action**: it sends `approved:false`, which maps to `reject` (the reject → `tool.failed` → `execution.interrupted` chain then flows on the event stream). A richer card (e.g. an explicit "Deny" label) would require the host to publish `ConfirmationOption`s, but the options can only express what opencode's permission reply can answer with (`once` / `reject` today — the `always` gap is tracked in futures.md §1.4). |
 | `chat/toolCallComplete` | Client-executed tool calls only ([§10](#10-client-provided-tools)): contributor-only, status must be running/pending-confirmation; echoes, then either settles the opencode-side waiter with the client's result or holds it for result confirmation. The reducer inlines the result fields (`success`, `pastTenseMessage`, `content`, `error`) onto the completed call — state has no `result` property — and applies the action only from Running/PendingConfirmation/AuthRequired (a success while auth-required is ignored). |
 | `chat/toolCallContentChanged` | Contributor-only echo of streamed partial content (reducer replaces the running call's `content`); opencode needs no counterpart. |
 | `chat/toolCallResultConfirmed` | Contributor-only; approves or denies a held client result (deny settles the waiter with a `Tool.Error` the model sees). |
-| `chat/turnCancelled` | Must name the active turn; interrupts the opencode session, echoes with a host-normalized `duration` (required on the wire — see below), then runs the queued/steering handoff itself (the `execution.interrupted` event finds no active turn and is skipped). |
+| `chat/turnCancelled` | Must name the active turn; interrupts the opencode session, echoes with a host-normalized `duration` (required on the wire — see below), then runs `finishTurn` itself (the `execution.interrupted` event finds no active turn and is skipped). A queued message stays queued. |
 | `chat/truncated` | State-only: the official reducer trims the stored turns (to and including `turnId`, or to none when omitted) and drops the active turn (status → idle). opencode's message history has no counterpart and is untouched, and an in-flight execution is not interrupted — its late events no-op against the post-truncation store (the documented use case: truncate, then `turnStarted` with the edited message). An invalid `turnId` shape (non-string / empty) is rejected; an unknown `turnId` follows the official reducer's no-op (accepted, state unchanged). |
 | `session/titleChanged` | On a session channel, renames its default OpenCode backend. On a chat channel (as used by VS Code's chat rename), renames that chat's backend. Titles above 256 characters are rejected (AHP sets no cap; opencode persists titles untruncated). The host echoes on the originating channel and updates the session's chat catalog. |
 | `session/activeClientSet` | `activeClient.clientId` must be the dispatching client. Normalizes the tools, echoes, and re-syncs the location-global opencode tool union ([§10](#10-client-provided-tools)). |

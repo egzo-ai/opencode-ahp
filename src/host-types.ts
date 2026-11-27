@@ -76,7 +76,21 @@ export interface ChatRuntime {
    * report-driven orphan turn originates its message as a system
    * notification, not user input (design §8).
    */
-  lastInbox: { text: string; delivery: string; subagent?: true } | null;
+  lastInbox: { id: string; text: string; delivery: string; subagent?: true } | null;
+  /**
+   * Inbox items opencode holds with delivery "queue", by inbox id.
+   * opencode delivers one only after the running turn's answer, inside
+   * the same execution (`session.inbox.delivered`), and never after an
+   * interrupt: that delivery is where the queued turn starts.
+   */
+  queuedInbox: Map<string, { text: string; subagent?: true }>;
+  /**
+   * Inbox id → the `chat/pendingMessageSet` id of the queued message a
+   * client sent as it (the prompt resolves with the inbox id).
+   */
+  queuedPending: Map<string, string>;
+  /** The inbox item the active turn was started for, when known. */
+  turnInboxID: string | null;
   // ── changesets ────────────────────────────────────────────────
   /**
    * Live chat-owned changeset stores (uncommitted + turn), keyed by

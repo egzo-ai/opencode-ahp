@@ -4,7 +4,6 @@
 
 import { HostTerminals } from "./host-terminals.js";
 import { ActionType, PendingMessageKind, Message } from "@microsoft/agent-host-protocol";
-import { userMessage } from "./bridge.js";
 import { ChatRuntime } from "./host-types.js";
 
 export class HostTurns extends HostTerminals {
@@ -18,11 +17,15 @@ export class HostTurns extends HostTerminals {
     return Math.max(0, Date.now() - (chat.turnStartedAt ?? Date.now()));
   }
 
-  /** Claim a turn (write-ahead) and publish `chat/turnStarted`. */
-  protected startTurn(chat: ChatRuntime, message: Message, queuedMessageId?: string): void {
+  /**
+   * Claim a turn (write-ahead) and publish `chat/turnStarted`. `inboxID`
+   * is the opencode inbox item the turn answers, when known.
+   */
+  protected startTurn(chat: ChatRuntime, message: Message, queuedMessageId?: string, inboxID?: string): void {
     const turnId = this.mintTurnId();
     chat.currentTurnId = turnId;
     chat.turnStartedAt = Date.now();
+    chat.turnInboxID = inboxID ?? null;
     this.publish({
       channel: chat.uri,
       action: {
@@ -37,9 +40,12 @@ export class HostTurns extends HostTerminals {
 
   /**
    * After a turn terminal: clear the steering message opencode consumed
-   * during the turn, and auto-start the next turn from the queue (the
-   * queued prompt was already sent with `delivery: "queue"` — opencode
-   * starts it automatically; this only updates the AHP state).
+   * during the turn. A queued message does not start here: opencode
+   * delivers it inside the same execution, after the running turn's
+   * answer, and the queued turn starts at that `session.inbox.delivered`
+   * (handleEvent). After an interrupt or a failure opencode keeps it in
+   * its inbox, and so it stays queued: AHP starts a queued message after
+   * a turn that finishes naturally.
    *
    * Then refresh the session's changesets — the turn's captured
    * "after" content is read from disk here, and the uncommitted/session/
@@ -49,6 +55,7 @@ export class HostTurns extends HostTerminals {
     const endedTurnId = chat.currentTurnId;
     chat.currentTurnId = null;
     chat.turnStartedAt = null;
+    chat.turnInboxID = null;
     const state = chat.chatStore.state;
     if (state.steeringMessage !== undefined) {
       this.publish({
@@ -60,18 +67,9 @@ export class HostTurns extends HostTerminals {
         },
       });
     }
-    const queued = state.queuedMessages;
-    if (queued !== undefined && queued.length > 0) {
-      const next = queued[0]!;
-      this.startTurn(chat, next.message, next.id);
-    } else if (chat.lastInbox !== null && chat.lastInbox.delivery === "queue") {
-      // A queued prompt from outside AHP (e.g. the TUI).
-      this.startTurn(chat, userMessage(chat.lastInbox.text));
-    }
     // The ended turn's command terminals leave the
     // root catalog now (retention — their state stays subscribable until
-    // the chat/record is removed). Runs after the possible
-    // chained startTurn so the published list is the post-handoff one.
+    // the chat/record is removed).
     if (this.opts.terminals && endedTurnId !== null && this.terminals.size > 0) {
       this.refreshTerminals();
     }
