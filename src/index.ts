@@ -36,6 +36,7 @@ import {
   writeFile as fsWriteFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative } from "node:path";
+import { homedir } from "node:os";
 import { createReadStream, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -73,6 +74,7 @@ import {
   type FacadeClientTool,
   type FacadeDirectoryEntry,
   type FacadeDiffFile,
+  type FacadeFormAnswer,
   type FacadeMcpServer,
   type FacadeModel,
   type FacadeModelRef,
@@ -513,6 +515,31 @@ async function countLines(absPath: string): Promise<number> {
 }
 
 /**
+ * A request to opencode's own HTTP server, for what the plugin surface
+ * lacks (the Form service: `session.form.reply` / `.cancel`). The server
+ * the plugin runs in is found the way opencode's own CLI finds it: the
+ * service file (`$XDG_STATE_HOME/opencode/service.json`, url + password)
+ * that `opencode serve --service` writes, or `OPENCODE_SERVER_URL` with
+ * `OPENCODE_SERVER_PASSWORD`. It is read at each call: a restarted
+ * service has a new port and password.
+ */
+async function serverRequest(method: string, path: string, body?: unknown): Promise<void> {
+  let url = process.env["OPENCODE_SERVER_URL"];
+  let password = process.env["OPENCODE_SERVER_PASSWORD"];
+  if (url === undefined) {
+    const state = process.env["XDG_STATE_HOME"] ?? join(homedir(), ".local", "state");
+    const service = JSON.parse(await fsReadFile(join(state, "opencode", "service.json"), "utf8")) as Record<string, unknown>;
+    if (typeof service["url"] !== "string") throw new Error("no url in opencode's service file");
+    url = service["url"];
+    if (typeof service["password"] === "string") password = service["password"];
+  }
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (password !== undefined && password !== "") headers["authorization"] = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+  const res = await fetch(new URL(path, url), { method, headers, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+  if (!res.ok) throw new Error(`${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
+}
+
+/**
  * The narrow opencode surface the bridge needs.
  *
  * The catalog and agents are re-read on every call (the host snapshots
@@ -764,6 +791,14 @@ function implementFacade(
         requestID: input.requestID,
         decision: input.decision,
       });
+    },
+    async replyForm(input: { sessionID: string; formID: string; answer: FacadeFormAnswer }) {
+      await serverRequest("POST", `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}/reply`, {
+        answer: input.answer,
+      });
+    },
+    async cancelForm(input: { sessionID: string; formID: string }) {
+      await serverRequest("DELETE", `/api/session/${encodeURIComponent(input.sessionID)}/form/${encodeURIComponent(input.formID)}`);
     },
     /**
      * The mapped event stream (bridge.ts `mapV2EventRaw` is the only

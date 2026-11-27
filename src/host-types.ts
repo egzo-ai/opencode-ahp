@@ -3,7 +3,7 @@
  */
 
 import { Implementation } from "@microsoft/agent-host-protocol";
-import { OpencodeFacade } from "./bridge.js";
+import { FacadeFormField, OpencodeFacade } from "./bridge.js";
 import { ClientToolInvocation } from "./client-tools.js";
 import { ChatStateStore, ChangesetStateStore, SessionStateStore, TerminalStateStore } from "./state.js";
 import type { PathPolicy } from "./path-policy.js";
@@ -97,6 +97,12 @@ export interface ChatRuntime {
   steeringPending: Map<string, string>;
   /** The inbox item the active turn was started for, when known. */
   turnInboxID: string | null;
+  /**
+   * The opencode forms open on this chat (form id → its fields), each
+   * mirrored as a `chat/inputRequested` request of the same id until it is
+   * answered, cancelled, or expires (design §8.2).
+   */
+  forms: Map<string, FacadeFormField[]>;
   // ── changesets ────────────────────────────────────────────────
   /**
    * Live chat-owned changeset stores (uncommitted + turn), keyed by

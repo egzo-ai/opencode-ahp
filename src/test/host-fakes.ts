@@ -280,6 +280,14 @@ export class FakeFacade implements OpencodeFacade {
   async replyPermission(input: { sessionID: string; requestID: string; decision: "once" | "reject" }) {
     this.permissionReplies.push(input);
   }
+  formReplies: { sessionID: string; formID: string; answer: Record<string, unknown> }[] = [];
+  formCancels: { sessionID: string; formID: string }[] = [];
+  async replyForm(input: { sessionID: string; formID: string; answer: Record<string, string | number | boolean | string[]> }) {
+    this.formReplies.push(input);
+  }
+  async cancelForm(input: { sessionID: string; formID: string }) {
+    this.formCancels.push(input);
+  }
   async removeSession(sessionID: string): Promise<void> {
     this.removeCalls.push(sessionID);
     // opencode fires session.deleted after a successful remove — mirror

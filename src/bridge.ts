@@ -244,7 +244,42 @@ export type FacadeEvent =
       /** Present when the permission was raised by a tool call (`id` = the tool call id). */
       source?: { type: "tool"; messageID: string; id: string };
     }
-  | { type: "permission.replied"; sessionID: string; requestID: string; reply: string };
+  | { type: "permission.replied"; sessionID: string; requestID: string; reply: string }
+  /**
+   * A form opencode asks the user to fill (`Form.Interface.ask`): the
+   * `question` tool, the web-search consent, … The asking tool waits until
+   * it is replied to or cancelled (or it expires).
+   */
+  | { type: "form.created"; sessionID: string; formID: string; title: string; fields: FacadeFormField[]; metadata?: Record<string, unknown> }
+  | { type: "form.replied"; sessionID: string; formID: string }
+  | { type: "form.cancelled"; sessionID: string; formID: string };
+
+/** One field of an opencode form (`Form.Field`), kept as opencode sends it. */
+export interface FacadeFormField {
+  key: string;
+  type: "string" | "number" | "integer" | "boolean" | "multiselect" | "external";
+  title?: string;
+  description?: string;
+  required?: boolean;
+  hidden?: boolean;
+  /** string (a choice when present) and multiselect */
+  options?: { value: string; label: string; description?: string }[];
+  /** string and multiselect: free text is allowed besides the options */
+  custom?: boolean;
+  default?: string | number | boolean | string[];
+  format?: string;
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  minItems?: number;
+  maxItems?: number;
+  /** external: the page the user opens */
+  url?: string;
+}
+
+/** A form answer, keyed by field key (`Form.Answer`). */
+export type FacadeFormAnswer = Record<string, string | number | boolean | string[]>;
 
 export interface FacadeToolContent {
   type: string;
@@ -362,6 +397,13 @@ export interface OpencodeFacade {
     requestID: string;
     decision: FacadePermissionDecision;
   }): Promise<void>;
+  /**
+   * Answer a pending opencode form, or cancel it. The Form service is not
+   * on the plugin surface: these go through opencode's own HTTP API
+   * (`session.form.reply` / `session.form.cancel`).
+   */
+  replyForm(input: { sessionID: string; formID: string; answer: FacadeFormAnswer }): Promise<void>;
+  cancelForm(input: { sessionID: string; formID: string }): Promise<void>;
   /**
    * The mapped event stream. The host passes its pump AbortSignal; the
    * iterator ends (without error) when the signal aborts.
@@ -875,6 +917,7 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
   const type = str(raw["type"]);
   if (type === undefined) return { status: "dropped", type: "?", reason: "missing: type" };
   const data = isObj(raw["data"]) ? raw["data"] : {};
+  if (type === "form.created") return mapFormCreated(type, data);
   const sessionID = str(data["sessionID"]);
   if (sessionID === undefined) return { status: "dropped", type, reason: "missing: sessionID" };
 
@@ -1085,6 +1128,12 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
         },
       };
     }
+    case "form.replied":
+    case "form.cancelled": {
+      const formID = str(data["id"]);
+      if (formID === undefined) return drop("id");
+      return { status: "ok", event: { type, sessionID, formID } };
+    }
     case "permission.replied": {
       const requestID = str(data["requestID"]);
       const reply = str(data["reply"]);
@@ -1106,6 +1155,54 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
 export function mapV2Event(raw: unknown): FacadeEvent | null {
   const outcome = mapV2EventRaw(raw);
   return outcome.status === "ok" ? outcome.event : null;
+}
+
+/** `form.created`: the form, its session inside it (`data.form.sessionID`). */
+function mapFormCreated(type: string, data: Record<string, unknown>): V2EventOutcome {
+  const form = isObj(data["form"]) ? data["form"] : undefined;
+  const sessionID = form !== undefined ? str(form["sessionID"]) : undefined;
+  const formID = form !== undefined ? str(form["id"]) : undefined;
+  if (form === undefined || sessionID === undefined || formID === undefined)
+    return { status: "dropped", type, reason: `missing: ${missingOf({ form, sessionID, formID })}` };
+  const kinds = ["string", "number", "integer", "boolean", "multiselect", "external"];
+  const fields: FacadeFormField[] = [];
+  for (const f of Array.isArray(form["fields"]) ? form["fields"] : []) {
+    if (!isObj(f)) continue;
+    const key = str(f["key"]);
+    const kind = str(f["type"]);
+    if (key === undefined || kind === undefined || !kinds.includes(kind)) continue;
+    const field: FacadeFormField = { key, type: kind as FacadeFormField["type"] };
+    for (const name of ["title", "description", "format", "url"] as const) {
+      const v = str(f[name]);
+      if (v !== undefined) field[name] = v;
+    }
+    for (const name of ["minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"] as const) {
+      const v = num(f[name]);
+      if (v !== undefined) field[name] = v;
+    }
+    for (const name of ["required", "hidden", "custom"] as const) {
+      if (typeof f[name] === "boolean") field[name] = f[name] as boolean;
+    }
+    const d = f["default"];
+    if (typeof d === "string" || typeof d === "number" || typeof d === "boolean") field.default = d;
+    else if (Array.isArray(d) && d.every((x) => typeof x === "string")) field.default = d as string[];
+    if (Array.isArray(f["options"])) {
+      field.options = [];
+      for (const o of f["options"]) {
+        if (!isObj(o) || str(o["value"]) === undefined) continue;
+        const option: { value: string; label: string; description?: string } = { value: str(o["value"])!, label: str(o["label"]) ?? str(o["value"])! };
+        if (str(o["description"]) !== undefined) option.description = str(o["description"])!;
+        field.options.push(option);
+      }
+    }
+    fields.push(field);
+  }
+  if (fields.length === 0) return { status: "dropped", type, reason: "missing: fields" };
+  const metadata = isObj(form["metadata"]) ? form["metadata"] : undefined;
+  return {
+    status: "ok",
+    event: { type: "form.created", sessionID, formID, title: str(form["title"]) ?? "", fields, ...(metadata !== undefined ? { metadata } : {}) },
+  };
 }
 
 function mapModelRef(v: unknown): FacadeModelRef | undefined {

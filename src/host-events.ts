@@ -3,8 +3,9 @@
  */
 
 import { HostDispatch } from "./host-dispatch.js";
-import { ActionType, PendingMessage, PendingMessageKind, ResponsePartKind, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
+import { ActionType, ChatInputResponseKind, PendingMessage, PendingMessageKind, ResponsePartKind, SessionChatInputRequest, SessionInputRequestKind, ToolCallContributorKind, ToolCallStatus, ErrorResponsePart, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from "@microsoft/agent-host-protocol";
 import { displayNameFor, pastTenseMessageFor, systemNotificationMessage, userMessage, FacadeEvent } from "./bridge.js";
+import { formRequest } from "./forms.js";
 import { ChatRuntime } from "./host-types.js";
 import { EXTERNAL_REGISTER_GRACE_MS, errorMessage, mapToolResultContent } from "./host-util.js";
 
@@ -472,6 +473,36 @@ export class HostEvents extends HostDispatch {
             action: { type: ActionType.SessionInputNeededSet, request },
           });
         }
+        return;
+      case "form.created": {
+        // A form opencode asks the user to fill (design §8.2): mirrored as
+        // an input request of the running turn, answered with
+        // chat/inputCompleted (dispatchInputCompleted).
+        if (chat.currentTurnId === null) {
+          this.log(`form ${ev.formID} outside a turn: not mirrored`);
+          return;
+        }
+        chat.forms.set(ev.formID, ev.fields);
+        const request = formRequest(ev.formID, ev.title, ev.fields);
+        this.publish({ channel: chatURI, action: { type: ActionType.ChatInputRequested, request } });
+        const needed: SessionChatInputRequest = { id: ev.formID, chat: chatURI, kind: SessionInputRequestKind.ChatInput, request };
+        this.publish({ channel: rec.channel, action: { type: ActionType.SessionInputNeededSet, request: needed } });
+        return;
+      }
+      case "form.replied":
+      case "form.cancelled":
+        // Answered or cancelled elsewhere (the TUI), or expired: the
+        // request closes. One the client completed is already gone.
+        if (!chat.forms.delete(ev.formID)) return;
+        this.publish({
+          channel: chatURI,
+          action: {
+            type: ActionType.ChatInputCompleted,
+            requestId: ev.formID,
+            response: ev.type === "form.replied" ? ChatInputResponseKind.Accept : ChatInputResponseKind.Cancel,
+          },
+        });
+        this.publish({ channel: rec.channel, action: { type: ActionType.SessionInputNeededRemoved, id: ev.formID } });
         return;
       case "permission.replied": {
         const toolCallId = chat.toolForPermission.get(ev.requestID);

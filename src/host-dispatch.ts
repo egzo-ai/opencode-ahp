@@ -3,8 +3,9 @@
  */
 
 import { HostSessions } from "./host-sessions.js";
-import { ActionType, SessionInputRequestKind, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTruncatedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
+import { ActionType, ChatInputAnswer, ChatInputCompletedAction, ChatInputResponseKind, ResponsePartKind, SessionInputRequestKind, ToolCallStatus, isClientDispatchable, ActionOrigin, ChatToolCallCompleteAction, ChatToolCallConfirmedAction, ChatToolCallContentChangedAction, ChatToolCallResultConfirmedAction, ChatTruncatedAction, ChatTurnCancelledAction, ChatTurnStartedAction, ChangesetFilesReviewChangedAction, Message, SessionActiveClient, SessionCustomizationToggledAction, SessionMcpServerStartRequestedAction, SessionMcpServerStopRequestedAction, SessionToolConfirmationRequest, StateAction, ToolCallResult } from "@microsoft/agent-host-protocol";
 import { FacadeDelivery, MCP_CUSTOMIZATION_ID_PREFIX } from "./bridge.js";
+import { formAnswer } from "./forms.js";
 import { normalizeToolDefinitions } from "./client-tools.js";
 import { channelKind, parseChangesetChannel } from "./channels.js";
 import { isRecord } from "./options.js";
@@ -146,6 +147,15 @@ export class HostDispatch extends HostSessions {
       case ActionType.ChatToolCallResultConfirmed:
         if (chat === undefined) { noChat(); return; }
         this.dispatchToolCallResultConfirmed(chat, stateAction, origin);
+        return;
+      case ActionType.ChatInputCompleted:
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchInputCompleted(chat, stateAction, origin);
+        return;
+      case ActionType.ChatInputAnswerChanged:
+        // A draft answer: state only (the reducer keeps it on the request).
+        if (chat === undefined) { noChat(); return; }
+        this.echo(channel, stateAction, origin);
         return;
       case ActionType.ChatTurnCancelled:
         if (chat === undefined) { noChat(); return; }
@@ -373,6 +383,50 @@ export class HostDispatch extends HostSessions {
         queuedMessageId: id,
       },
     });
+  }
+
+  /**
+   * `chat/inputCompleted`: the client answered (accept) or dismissed
+   * (decline / cancel) an input request mirrored from an opencode form
+   * (design §8.2). The answer goes to opencode's Form service through its
+   * HTTP API, the plugin surface having none; opencode then resumes the
+   * tool that asked. A rejected reply (a required field left out) leaves
+   * the request open.
+   */
+  private async dispatchInputCompleted(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
+    const rec = this.byChannel.get(chatURI)!;
+    const a = action as ChatInputCompletedAction;
+    const fields = typeof a.requestId === "string" ? chat.forms.get(a.requestId) : undefined;
+    if (fields === undefined) {
+      this.echo(chatURI, action, origin, `no open input request ${String(a.requestId)}`);
+      return;
+    }
+    // no longer open for the pump: opencode's own form.replied / form.cancelled comes while the reply is under way, and must not close
+    // the request first, without the client's answers
+    chat.forms.delete(a.requestId);
+    try {
+      if (a.response === ChatInputResponseKind.Accept) {
+        const answers = { ...(this.openInputAnswers(chat, a.requestId) ?? {}), ...(a.answers ?? {}) };
+        await this.opts.facade.replyForm({ sessionID: chat.sessionID, formID: a.requestId, answer: formAnswer(fields, answers) });
+      } else {
+        await this.opts.facade.cancelForm({ sessionID: chat.sessionID, formID: a.requestId });
+      }
+    } catch (err) {
+      chat.forms.set(a.requestId, fields);
+      this.echo(chatURI, action, origin, `the form reply failed: ${errorMessage(err)}`);
+      return;
+    }
+    this.echo(chatURI, action, origin);
+    this.publish({ channel: rec.channel, action: { type: ActionType.SessionInputNeededRemoved, id: a.requestId } });
+  }
+
+  /** The draft answers an open input request of the running turn holds. */
+  private openInputAnswers(chat: ChatRuntime, requestId: string): Record<string, ChatInputAnswer> | undefined {
+    for (const p of chat.chatStore.state.activeTurn?.responseParts ?? []) {
+      if (p.kind === ResponsePartKind.InputRequest && p.request.id === requestId) return p.request.answers;
+    }
+    return undefined;
   }
 
   private async dispatchToolCallConfirmed(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
