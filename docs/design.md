@@ -491,6 +491,10 @@ resurfacing after a location reload) become AHP sessions in two ways:
    channel; if the slow path wins, `handleCreateSession` heals it by
    dropping the interim record and re-registering under the client's
    channel.
+   Events of the session that arrive during the grace are queued and
+   replayed in order once it is registered: the TUI creates a session and
+   prompts it at once, and its first turn (`execution.started`, its parts,
+   its end) would otherwise be dropped.
 2. **`listSessions`** — every listed opencode session is lazily
    registered (idempotent), which is how sessions survive a restart.
 

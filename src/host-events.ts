@@ -39,8 +39,46 @@ export class HostEvents extends HostDispatch {
     this.pumpController = null;
   }
 
+  /**
+   * Events of an external session that waits out its registration grace,
+   * in order: the TUI creates a session and prompts it at once, so its
+   * first turn's `execution.started` and parts arrive before the session
+   * is registered. They are replayed, in order, once it is (design §7.2).
+   */
+  private pendingExternal = new Map<string, FacadeEvent[]>();
+
   // ── opencode event pump handlers ───────────────────────────────────────
   private async handleEvent(ev: FacadeEvent): Promise<void> {
+    const waiting = ev.type === "session.created" ? undefined : this.pendingExternal.get(ev.sessionID);
+    if (waiting !== undefined) {
+      waiting.push(ev);
+      return;
+    }
+    return this.handleBoundEvent(ev);
+  }
+
+  /** Registers a deferred external session, then replays what came for it meanwhile; what comes during the replay joins the queue. */
+  private async registerAndReplay(sessionID: string): Promise<void> {
+    try {
+      await this.registerExternalDeferred(sessionID);
+    } finally {
+      const queue = this.pendingExternal.get(sessionID) ?? [];
+      try {
+        while (queue.length > 0) {
+          const next = queue.shift() as FacadeEvent;
+          try {
+            await this.handleBoundEvent(next);
+          } catch (err) {
+            this.log(`replaying ${next.type} for ${sessionID}: ${errorMessage(err)}`);
+          }
+        }
+      } finally {
+        this.pendingExternal.delete(sessionID);
+      }
+    }
+  }
+
+  private async handleBoundEvent(ev: FacadeEvent): Promise<void> {
     if (ev.type === "session.created") {
       // Subagent children (a `parentID` in the created event) never
       // surface as AHP sessions — skip them before the deferral so no
@@ -56,8 +94,9 @@ export class HostEvents extends HostDispatch {
       // the delete+recreate remap in `handleCreateSession` heals the slow
       // path.
       const sessionID = ev.sessionID;
+      if (!this.pendingExternal.has(sessionID)) this.pendingExternal.set(sessionID, []);
       setTimeout(() => {
-        void this.registerExternalDeferred(sessionID).catch((err) =>
+        void this.registerAndReplay(sessionID).catch((err) =>
           this.log(`external session registration failed: ${errorMessage(err)}`),
         );
       }, EXTERNAL_REGISTER_GRACE_MS);

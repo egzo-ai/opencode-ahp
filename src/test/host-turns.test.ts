@@ -168,6 +168,28 @@ describe("turn lifecycle", () => {
     h.stop();
   });
 
+  it("a session the TUI creates and prompts at once keeps its first turn (events during the registration grace are replayed)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const ses = "ses_tui_fast";
+    const now = Date.now();
+    h.facade.sessions.set(ses, { sessionID: ses, title: "TUI", time: { created: now, updated: now } });
+    // all before the host has registered the session: created, prompted, started, answered, done
+    h.facade.push({ type: "session.created", sessionID: ses });
+    h.facade.push({ type: "inbox.enqueued", sessionID: ses, inboxID: "m1", text: "typed at once", delivery: "default" });
+    h.facade.push({ type: "execution.started", sessionID: ses });
+    h.facade.push({ type: "execution.succeeded", sessionID: ses });
+    const chatURI = chatChannelURI(ses);
+    let state: Awaited<ReturnType<typeof chatSnapshotState>> | null = null;
+    for (let i = 0; i < 100 && (state === null || state.turns.length === 0); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      if (h.frames.some((f) => f.message.method === "root/sessionAdded")) state = await chatSnapshotState(h, 1, chatURI, 500 + i);
+    }
+    expect(state?.turns.map((t) => [t.message.text, t.state])).toEqual([["typed at once", "complete"]]);
+    h.stop();
+  });
+
   it("an idle subagent report starts a host-minted turn with a system-notification origin", async () => {
     const h = makeHarness();
     h.init(1, "c1");
