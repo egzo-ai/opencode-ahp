@@ -31,7 +31,7 @@ v2.2.6 source and current `main` where noted.
 Candidate work — **none of it planned or scheduled**. Each item below
 names its blocker, or the reason it is not worth doing today.
 
-### 1.1 Elicitation completion (decision pending)
+### 1.1 Elicitation
 
 **What it is.** AHP 1.0.0 *elicitation* is the host asking the **user**
 for structured input mid-turn — a preference, a clarification, a
@@ -84,13 +84,17 @@ answers then return to the model as tool output.
   plugin event stream and cannot recover them later. The durable,
   replayable signal is the `question` **tool call**, not the Form.
 
-**Status.** The host handles the other two input-request kinds
-(`toolConfirmation` and `toolClientExecution`); it does **not** handle
-`chatInput` — hence elicitation is partial today. Surfacing an
-elicitation to AHP clients is well within the existing surface;
-completing it has no plugin-side path today.
+**Status: shipped through opencode's HTTP API.** The host mirrors every
+form opencode opens during a turn (the `question` tool's and any other,
+like the web-search consent) as a `chatInput` request, and routes a
+client's answer to the Form service through opencode's own HTTP API on the
+server the plugin runs in ([design.md §8.2](design.md#82-forms-as-input-requests)):
+the plugin surface still has no `ctx.form`. Remaining: forms are
+live-only, so a request opened before a reload or reconnect of the host is
+not recovered, and a `ctx.form` on the plugin surface (option (a) below)
+would replace the HTTP detour.
 
-**Options (a real design decision, user call pending):**
+**The options that were weighed:**
 
 - **(a) opencode feature request** — expose a Form reply surface to
   plugins (`ctx.form` with `reply`/`cancel`); parallel to the other

@@ -36,6 +36,7 @@ export class HostChats extends HostClientTools {
       toolForPermission: new Map(),
       clientToolCalls: new Map(),
       lastInbox: null,
+      forms: new Map(),
       changesets: new Map(),
       turnSnapshots: new Map(),
     };

@@ -46,6 +46,9 @@ In the Agents window, an `opencode` host with:
   exposes no fork to plugins).
 - **Steering + queue** — send a message mid-turn and it either steers the
   running turn or queues for the next one.
+- **Questions** — when opencode asks something (the `question` tool, the
+  web-search consent, any form), the client gets it as an input request
+  and its answer goes back to opencode.
 - **Changesets** — diff views of the uncommitted, per-session, and
   per-turn changes, backed by the project's git state, with a
   discard-changes operation to restore a file. Requires the project

@@ -924,6 +924,36 @@ turn is 38). The LAN test server
 the scaffolded project config, so live verification gets the capture for
 free: `grep "event " /tmp/ahp-server/server.log`.
 
+### 8.2 Forms as input requests
+
+opencode asks the user through its **Form** service — the `question`
+tool, the web-search consent ("Allow OpenCode to search the web…?"), and
+others — and the asking tool **blocks** until the form is replied to,
+cancelled, or expires. The host mirrors each form opened during a turn as
+an AHP elicitation ([futures.md §1.1](futures.md#11-elicitation)):
+
+- `form.created` (live-only; its session is inside `data.form`) →
+  `chat/inputRequested` with a request of the form's id: one question per
+  visible field (`string` with options → single-select, `string` → text,
+  `number` / `integer`, `boolean`, `multiselect` → multi-select; `custom`
+  → `allowFreeformInput`), an `external` field as the request's `url`. It
+  is mirrored at session level as a `chatInput` request
+  (`session/inputNeededSet`). A form outside a turn is not mirrored.
+- `chat/inputCompleted` from a client → `accept` replies to the form with
+  the answers in each field's own value type; `decline` / `cancel`
+  cancels it. The Form service is **not on the plugin surface**, so both
+  go through opencode's own HTTP API (`POST
+  /api/session/:id/form/:formID/reply`, `DELETE
+  /api/session/:id/form/:formID`), on the server the plugin runs in:
+  found through the service file `opencode serve --service` writes
+  (`$XDG_STATE_HOME/opencode/service.json`, url + password), or
+  `OPENCODE_SERVER_URL` / `OPENCODE_SERVER_PASSWORD`. A refused reply (a
+  required field missing) rejects the action and the request stays open.
+- `form.replied` / `form.cancelled` for a form still open (answered in the
+  TUI, or expired) → the host completes the request itself (`accept` /
+  `cancel`) and removes the session-level mirror.
+- `chat/inputAnswerChanged` (draft answers) is state only: echoed.
+
 ## 9. Client-dispatchable actions
 
 `dispatchAction` is a **notification** — there is no JSON-RPC response.
@@ -946,6 +976,8 @@ identifies a single chat once multi-chat is on).
 | `chat/turnStarted` | Rejected when a turn is already active ("follow-ups go via `chat/pendingMessageSet`"). Otherwise: apply the message's model/agent selection to this chat's opencode session, **claim the turn before the prompt** (write-ahead, so a racing `execution.started` still joins it; reverted on prompt failure), prompt, then echo (with a host-normalized `startedAt` — see the reducer-trap note after this table). |
 | `chat/pendingMessageSet` | `steering` mid-turn → prompt with `delivery: "steer"`; `queued` mid-turn → `delivery: "queue"`; with no active turn the message starts a turn right now (echo, then a host-minted `chat/turnStarted` carrying `queuedMessageId`). |
 | `chat/pendingMessageRemoved` | Always rejected: opencode has no inbox cancel — a pending message cannot be withdrawn once sent. |
+| `chat/inputCompleted` | Answers (`accept`) or cancels (`decline` / `cancel`) the opencode form the request mirrors, through opencode's HTTP API ([§8.2](#82-forms-as-input-requests)), then echoes and clears the session input request. Rejected for a request the host does not hold open, or when opencode refuses the answer. |
+| `chat/inputAnswerChanged` | Draft answers: echoed (state only). |
 | `chat/toolCallConfirmed` | Replies to the pending opencode permission (`once` / `reject`), echoes (reducer → running/cancelled), and clears the session input request. The confirmation UI is the plain approve/deny card because the host publishes no `ConfirmationOption`s — that field on `ToolCallPendingConfirmationState` is optional, and when present the client renders them *instead of* the plain UI. VS Code therefore shows "Allow in this Session ⌄" plus **"Skip"**, where **Skip is the deny action**: it sends `approved:false`, which maps to `reject` (the reject → `tool.failed` → `execution.interrupted` chain then flows on the event stream). A richer card (e.g. an explicit "Deny" label) would require the host to publish `ConfirmationOption`s, but the options can only express what opencode's permission reply can answer with (`once` / `reject` today — the `always` gap is tracked in futures.md §1.4). |
 | `chat/toolCallComplete` | Client-executed tool calls only ([§10](#10-client-provided-tools)): contributor-only, status must be running/pending-confirmation; echoes, then either settles the opencode-side waiter with the client's result or holds it for result confirmation. The reducer inlines the result fields (`success`, `pastTenseMessage`, `content`, `error`) onto the completed call — state has no `result` property — and applies the action only from Running/PendingConfirmation/AuthRequired (a success while auth-required is ignored). |
 | `chat/toolCallContentChanged` | Contributor-only echo of streamed partial content (reducer replaces the running call's `content`); opencode needs no counterpart. |
