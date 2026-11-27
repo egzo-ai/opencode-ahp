@@ -38,6 +38,7 @@ export class HostChats extends HostClientTools {
       lastInbox: null,
       queuedInbox: new Map(),
       queuedPending: new Map(),
+      steeringPending: new Map(),
       turnInboxID: null,
       changesets: new Map(),
       turnSnapshots: new Map(),
